@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "An inbound GPT-Live SIP bridge for durable, scoped Pots tasks",
+  "description": "A mobile GPT-Live WebRTC and inbound SIP bridge for durable, scoped Pots tasks",
   "engines": { "node": ">=24" },
-  "scripts": { "test": "node --disable-warning=ExperimentalWarning --test", "demo": "node --disable-warning=ExperimentalWarning --test --test-name-pattern='local end-to-end' test/bridge.test.mjs" },
+  "scripts": { "test": "node --disable-warning=ExperimentalWarning --test", "demo": "node --disable-warning=ExperimentalWarning --test --test-name-pattern='local end-to-end' test/bridge.test.mjs test/web.test.mjs" },
   "dependencies": { "ws": "8.23.0" },
   "license": "MIT"
 }

@@ -68,8 +68,9 @@ export function localServer(bridge, admin = false) {
     const { store } = bridge;
     let result;
     if (admin) {
-      if (req.url !== '/arm') { reply(res, 404); return; }
-      result = bridge.arm();
+      if (req.url === '/arm') result = bridge.arm();
+      else if (req.url === '/invite-web') result = bridge.inviteWeb();
+      else { reply(res, 404); return; }
     } else {
       if (['/claim', '/complete', '/fail', '/mark-wake', '/mark-delivery'].includes(req.url) &&
           (typeof data.id !== 'string' || !receiptPattern.test(data.id))) { reply(res, 400); return; }
