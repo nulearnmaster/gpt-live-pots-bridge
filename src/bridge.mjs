@@ -6,7 +6,7 @@ const armMs = 120_000;
 const pairMs = 45_000;
 const callMs = 20 * 60_000;
 const webLeaseMs = 20_000;
-const webCallMs = 115_000; // Leave a bounded grace period within the two-minute pilot.
+const confirmedEndMs = 30_000;
 const tokenPattern = /^[A-Za-z0-9_-]{43}$/;
 const token = () => randomBytes(32).toString('base64url');
 const matches = (grant, value) => typeof value === 'string' && tokenPattern.test(value) && grant &&
@@ -62,11 +62,14 @@ export class Bridge {
   beginWeb(sdp, permit = null) {
     if (this.blocked() || !validSDP(sdp)) return null;
     const attempt = `web_${randomUUID()}`;
-    if (!this.store.reserveWeb(attempt, this.clock())) return null;
+    if (!this.store.reserveWeb(attempt, this.clock(), !permit)) return null;
     const call = new WebCall(this, attempt);
     call.permit = permit;
     this.call = call;
     return call.start(sdp);
+  }
+  ownerWebAwaitingRecovery() {
+    return !this.call && (this.recovering || this.store.unclosed(this.clock()).length > 0);
   }
   // The owner is authenticated by the private gate on every RPC. The grant
   // below binds only that tab's current click, not the browser's identity.
@@ -91,9 +94,12 @@ export class Bridge {
   async endOwnerWeb(value) {
     if (!this.trustedWebOwner) return null;
     if (matches(this.call?.permit, value)) return !!(await this.call.end(true));
-    if (!matches(this.ownerPermit, value)) return null;
-    this.ownerPermit = null; // End beat the SDP POST; a late create cannot start.
-    return true;
+    if (matches(this.ownerPermit, value)) {
+      this.ownerPermit = null; // End beat the SDP POST; a late create cannot start.
+      return true;
+    }
+    if (this.lastOwnerEnd?.expires > this.clock() && matches(this.lastOwnerEnd, value)) return true;
+    return null;
   }
   touchWeb(cookie) {
     if (!this.hasWebAuth(cookie) || this.call?.kind !== 'webrtc' || this.call.phase === 'closed') return false;
@@ -151,7 +157,7 @@ export class Bridge {
   }
   async stop() {
     this.stopped = true;
-    this.grant = this.webGrant = this.webAuth = this.ownerPermit = null;
+    this.grant = this.webGrant = this.webAuth = this.ownerPermit = this.lastOwnerEnd = null;
     clearTimeout(this.armTimer);
     await this.call?.end(true);
   }
@@ -168,7 +174,7 @@ class Call {
     this.pending = new Set();
     this.transcriptFloor = 0;
     this.latestUnauthenticatedEnd = 0;
-    this.timer = setTimeout(() => this.end(true), timeout);
+    if (timeout !== null) this.timer = setTimeout(() => this.end(true), timeout);
   }
   async start() {
     const { provider } = this.bridge;
@@ -330,7 +336,7 @@ class Call {
 
 class WebCall extends Call {
   constructor(bridge, reservation) {
-    super(bridge, null, null, webCallMs);
+    super(bridge, null, null, null); // No local WebRTC elapsed-time cap; only the liveness lease.
     this.kind = 'webrtc';
     this.reservation = reservation;
     this.touch();
@@ -357,10 +363,10 @@ class WebCall extends Call {
       if (this.phase === 'closed') throw Error('ended during create');
       await this.connect(() => { this.phase = 'active'; });
       if (this.phase !== 'active') throw Error('not active');
-      return answer;
+      return { sdp: answer };
     } catch {
-      await this.end(true);
-      throw Error('cannot start WebRTC');
+      const confirmed = await this.end(true);
+      return { state: confirmed ? (this.rejected ? 'rejected' : 'closed') : 'unconfirmed' };
     }
   }
   terminal(type) {
@@ -382,6 +388,9 @@ class WebCall extends Call {
         }
         this.bridge.store.endCall(this.reservation);
         confirmed = true;
+        if (!this.bridge.stopped && this.permit) {
+          this.bridge.lastOwnerEnd = { ...this.permit, expires: this.bridge.clock() + confirmedEndMs };
+        }
       } catch { logFailure('WebRTC cleanup not confirmed; new calls blocked'); }
       finally {
         this.socket?.terminate();

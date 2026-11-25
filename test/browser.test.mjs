@@ -64,6 +64,11 @@ function localPeers() {
       return new Response(null, { status: 204 });
     }
     if (path !== '/api/session' || body.consent !== true) throw Error('unexpected request');
+    if (state.startFailure) {
+      const failure = state.startFailure;
+      state.startFailure = undefined;
+      return new Response(JSON.stringify({ state: failure }), { status: failure === 'unconfirmed' ? 503 : 502 });
+    }
     const remote = state.remote = new NativePeer();
     const remoteStream = state.remoteStream = await gum({ audio: true });
     remote.addTrack(remoteStream.getAudioTracks()[0], remoteStream);
@@ -195,15 +200,36 @@ test('optional Chromium fixture: stable bookmark, consent, hidden-page cancellat
     assert.equal(await js('fixture.micAttempts'), 0);
     assert.equal(await js('fixture.requests.map(([path]) => path).join()'), '/api/owner');
     assert.equal(await js('document.cookie'), '');
+    await js("fixture.startFailure = 'rejected'");
+    await tap('#start');
+    await waitFor(() => js("!document.querySelector('#start').disabled && document.querySelector('#status').textContent.includes('대화가 시작되지 않았습니다')"));
+    assert(await js("fixture.phoneStream.getTracks().every((track) => track.readyState === 'ended')"));
+    assert.equal(await js("fixture.requests.filter(([p]) => p === '/api/end').length"), 0);
+    await js("fixture.startFailure = 'closed'");
+    await tap('#start');
+    await waitFor(() => js("!document.querySelector('#start').disabled && document.querySelector('#status').textContent.includes('서버에서 대화를 종료')"));
+    assert.equal(await js("fixture.requests.filter(([p]) => p === '/api/end').length"), 0);
     for (let i = 0; i < 2; i++) {
       await tap('#start');
       await waitFor(() => js("document.documentElement.hasAttribute('data-live')"));
       await tap('#end');
       await waitFor(() => js("fixture.phone.connectionState === 'closed' && !document.querySelector('#start').disabled"));
     }
-    assert.equal(await js('fixture.micAttempts'), 2);
-    assert.deepEqual(await js("fixture.requests.filter(([p]) => p === '/api/session').map(([, body]) => body.consent)"), [true, true]);
-    assert.equal(await js("new Set(fixture.requests.filter(([p]) => p === '/api/session').map(([, body]) => body.permit)).size"), 2);
+    assert.equal(await js('fixture.micAttempts'), 4);
+    assert.deepEqual(await js("fixture.requests.filter(([p]) => p === '/api/session').map(([, body]) => body.consent)"), [true, true, true, true]);
+    assert.equal(await js("new Set(fixture.requests.filter(([p]) => p === '/api/session').map(([, body]) => body.permit)).size"), 4);
+    await call('Page.reload');
+    await waitFor(() => js("!!fixture && fixture.requests[0]?.[0] === '/api/owner' && !document.querySelector('#start').disabled"));
+    assert.equal(await js('fixture.micAttempts'), 0);
+    await tap('#start');
+    await waitFor(() => js("document.documentElement.hasAttribute('data-live')"));
+    await tap('#end');
+    await waitFor(() => js("fixture.phone.connectionState === 'closed' && !document.querySelector('#start').disabled"));
+    await js("fixture.startFailure = 'unconfirmed'");
+    await tap('#start');
+    await waitFor(() => js("document.querySelector('#start').disabled && !document.querySelector('#start').hidden && document.querySelector('#status').textContent.includes('다시 연결할 수 없습니다')"));
+    assert(await js("fixture.phoneStream.getTracks().every((track) => track.readyState === 'ended')"));
+    assert.equal(await js("fixture.requests.filter(([p]) => p === '/api/end').length"), 1);
     assert.equal(await js('location.hash'), '');
     assert.equal(await js('document.cookie'), '');
   });

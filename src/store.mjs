@@ -29,11 +29,11 @@ export class Store {
   reserve(session, delivery, now) {
     return !!this.db.prepare('INSERT OR IGNORE INTO calls (session, delivery, created) VALUES (?, ?, ?)').run(session, delivery, now).changes;
   }
-  reserveWeb(attempt, now) {
+  reserveWeb(attempt, now, invitationCooldown = true) {
     return !!this.db.prepare(`INSERT INTO calls (session, delivery, created, transport)
       SELECT ?, ?, ?, 'webrtc' WHERE NOT EXISTS (SELECT 1 FROM calls WHERE
-        (transport='webrtc' AND (closed=0 OR created >= ?)) OR (closed=0 AND created >= ?))`)
-      .run(attempt, attempt, now, now - 30_000, now - 3 * 3600_000).changes;
+        (transport='webrtc' AND (closed=0 OR (?=1 AND created >= ?))) OR (closed=0 AND created >= ?))`)
+      .run(attempt, attempt, now, Number(invitationCooldown), now - 30_000, now - 3 * 3600_000).changes;
   }
   bindWeb(attempt, session) {
     return !!this.db.prepare("UPDATE calls SET session=? WHERE session=? AND transport='webrtc' AND closed=0")

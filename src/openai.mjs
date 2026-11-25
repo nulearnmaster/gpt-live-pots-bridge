@@ -38,7 +38,8 @@ export const sessionConfig = {
 };
 
 const webSessionConfig = {
-  ...sessionConfig, model: 'gpt-live-1.1',
+  // Live REST Create uses MediaSessionConfig, which does not have session.type.
+  model: 'gpt-live-1.1', store: false, delegation: sessionConfig.delegation,
   instructions: `${sessionConfig.instructions} Be concise. Default to Korean unless the caller prefers another language.`,
   client: { data_channel: { allowed_client_events: [], allowed_server_events: [
     { type: 'session.started' }, { type: 'session.closed' },
@@ -57,15 +58,35 @@ export function validSDP(sdp) {
   return media.length === 2 && media.includes('audio') && media.includes('application');
 }
 
-async function boundedJSON(response) {
+async function boundedJSON(response, limit = 128 * 1024) {
   const pieces = [];
   let bytes = 0;
   for await (const piece of response.body) {
     bytes += piece.length;
-    if (bytes > 128 * 1024) throw Error('oversized Live reply');
+    if (bytes > limit) throw Error('oversized Live reply');
     pieces.push(piece);
   }
   return JSON.parse(Buffer.concat(pieces));
+}
+
+// Only exact, known enum values are logged. Never echo API error messages,
+// parameter paths, request identifiers, headers, or unknown strings.
+const errorTypes = new Set([
+  'invalid_request_error', 'authentication_error', 'permission_error', 'not_found_error',
+  'rate_limit_error', 'insufficient_quota', 'api_error', 'server_error',
+]);
+const errorCodes = new Set([
+  'invalid_api_key', 'model_not_found', 'unsupported_model', 'permission_denied', 'access_denied',
+  'unknown_parameter', 'unsupported_parameter', 'missing_required_parameter', 'invalid_value',
+  'unsupported_value', 'invalid_sdp', 'invalid_request_error', 'rate_limit_exceeded',
+  'insufficient_quota', 'billing_hard_limit_reached', 'organization_deactivated', 'server_error',
+]);
+async function logCreateFailure(response) {
+  let error;
+  try { error = (await boundedJSON(response, 8192))?.error; } catch { /* status still known */ }
+  const type = errorTypes.has(error?.type) ? ` type=${error.type}` : '';
+  const code = errorCodes.has(error?.code) ? ` code=${error.code}` : '';
+  process.stderr.write(`voice-bridge: Live WebRTC create failed http=${response.status}${type}${code}\n`);
 }
 
 // Live's REST hangup is SIP-only. Keep listening for session.closed (not
@@ -132,7 +153,7 @@ export function openAI(apiKey, { base = 'https://api.openai.com', fetcher = fetc
         signal: AbortSignal.timeout(8000), body: JSON.stringify({ session: { ...webSessionConfig, audio: { output: { voice: webVoice } } }, transport: { type: 'webrtc', sdp } }),
       });
       if (response.status !== 201) {
-        await response.body?.cancel();
+        await logCreateFailure(response);
         // Do not treat server errors, timeouts or redirects as proof that a
         // session was never created. Never retry a possibly billable create.
         if ([400, 401, 403, 404, 413, 415, 422, 429].includes(response.status)) return { rejected: true };

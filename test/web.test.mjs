@@ -44,6 +44,7 @@ async function fakeLive() {
     const code = state.code ?? 201;
     const id = `live_web_${state.requests.length}`;
     res.writeHead(code, { 'Content-Type': 'application/json' });
+    if (state.errorBody && code !== 201) { res.end(JSON.stringify({ error: state.errorBody })); return; }
     res.end(JSON.stringify({ session: { id }, secret: 'never-forward-fixture-field', transport: {
       type: 'webrtc', sdp: state.invalidAnswer ? 'invalid-answer' : answer,
     } }));
@@ -154,8 +155,8 @@ test('web only exposes its own routes; permission, one-use grant, consent, secur
   const page = await web('/', { method: 'GET' });
   assert.equal(page.status, 200);
   assert.match(page.body, /비용에 동의하고 시작/);
-  assert.match(page.body, /2분 후 종료 시도 · 예상 US\$0\.10/);
-  assert.match(page.body, /종료 확인이 지연되면 요금이 추가될 수 있습니다/);
+  assert.match(page.body, /GPT-Live 음성 · 분당 US\$0\.05/);
+  assert.doesNotMatch(page.body, /2분 후 종료/);
   assert.equal(page.headers['cache-control'], 'no-store');
   assert.match(page.headers['content-security-policy'], /frame-ancestors 'none'/);
   for (const headers of [{ Host: 'wrong.invalid' }, { 'X-Forwarded-Proto': 'http' }, { Origin: 'https://other.invalid' },
@@ -201,12 +202,15 @@ test('local end-to-end: Live WebRTC signaling + sideband, ongoing delegation, en
   assert.equal((await h.web('/api/lease', { headers: { Cookie } })).status, 204);
   const [create] = fake.requests;
   assert.deepEqual(create.transport, { type: 'webrtc', sdp });
-  assert.equal(create.session.type, 'live');
+  assert.equal(create.session.type, undefined); // MediaSessionConfig is not a session-start event.
+  assert.deepEqual(Object.keys(create.session).sort(), ['audio', 'client', 'delegation', 'input', 'instructions', 'model', 'store']);
   assert.equal(create.session.model, 'gpt-live-1.1');
   assert.equal(create.session.store, false);
   assert.deepEqual(create.session.audio, { output: { voice: 'marin' } });
   assert.deepEqual(create.session.delegation, { type: 'client', acknowledgement_delay_ms: 800 });
-  assert.deepEqual(create.session.client.data_channel.allowed_client_events, []);
+  assert.deepEqual(create.session.client.data_channel, { allowed_client_events: [], allowed_server_events: [
+    { type: 'session.started' }, { type: 'session.closed' },
+  ] });
   assert.equal(create.session.tools, undefined);
   assert(!JSON.stringify(create.session.input).includes('keypad'));
   const spoken = (name, text) => fake.events.find((e) => e.delegation_id === name && e.content?.startsWith(text));
@@ -262,7 +266,9 @@ test('End during creation cannot orphan a known WebRTC session; SDP answer is wi
   const ending = h.web('/api/end', { headers: { Cookie } });
   await waitFor(() => h.running().bridge.call?.phase === 'closed');
   release();
-  assert.equal((await opening).status, 503);
+  const failure = await opening;
+  assert.equal(failure.status, 502);
+  assert.deepEqual(JSON.parse(failure.body), { state: 'closed' });
   assert.equal((await ending).status, 204);
   assert.equal(h.fake.events.find(({ type }) => type === 'session.close').id, 'live_web_1');
   assert.deepEqual(h.running().store.unclosed(0), []);
@@ -272,13 +278,17 @@ test('bad answer with known ID is closed by sideband; ambiguous create blocks bo
   const h = await setup(t);
   const auth = async () => h.redeem(await h.invite());
   h.fake.invalidAnswer = true;
-  assert.equal((await h.start(await auth())).status, 503);
+  const failed = await h.start(await auth());
+  assert.equal(failed.status, 502);
+  assert.deepEqual(JSON.parse(failed.body), { state: 'closed' });
   assert.equal(h.fake.events.find(({ type }) => type === 'session.close').id, 'live_web_1');
   assert.deepEqual(h.running().store.unclosed(0), []);
   h.time(30_001);
   h.fake.invalidAnswer = false;
   h.fake.code = 500;
-  assert.equal((await h.start(await auth())).status, 503);
+  const unconfirmed = await h.start(await auth());
+  assert.equal(unconfirmed.status, 503);
+  assert.deepEqual(JSON.parse(unconfirmed.body), { state: 'unconfirmed' });
   assert.equal(h.running().store.unclosed(0)[0].pending, 1);
   await h.stop();
   await h.launch(true);
@@ -397,15 +407,84 @@ test('bookmark works on restart without cookies; short permits are consent-bound
   assert.equal((await post('/api/lease', { permit: current })).status, 204);
   assert.equal((await post('/api/prepare', { consent: true })).status, 409);
   assert.equal((await post('/api/end', { permit: current })).status, 204);
-  const cooldown = await prepare();
-  assert.equal((await start(cooldown)).status, 409);
-  h.time(30_001);
   await h.admin('/arm');
   assert.equal((await post('/api/prepare', { consent: true })).status, 409);
-  h.time(120_001);
-  // SIP arm expiry timer normally uses wall time; restart to clear fixture's in-memory arm.
+  // Restart clears the in-memory SIP arm. Confirmed End already released the
+  // durable slot: the stable bookmark can start again at the same wall time.
   await h.stop();
   await h.launch(true);
-  assert.equal((await start(await prepare())).status, 201);
+  const next = await prepare();
+  assert.equal((await start(next)).status, 201);
+  assert.equal((await post('/api/lease', { permit: next })).status, 204);
   assert.equal(h.fake.requests.length, 2);
+});
+
+test('known rejects log HTTP status and only exact diagnostic enums; trusted Start→End→Start does not wait', async (t) => {
+  const h = await setup(t, { owner: true });
+  const post = (path, data) => h.web(path, { data, headers: ownerHeaders });
+  const prepare = async () => JSON.parse((await post('/api/prepare', { consent: true })).body).permit;
+  const start = (permit) => post('/api/session', { consent: true, sdp, permit });
+  const logs = [];
+  t.mock.method(process.stderr, 'write', (line) => { logs.push(String(line)); return true; });
+  const sensitive = 'fixture-never-log-this-utterance@example.invalid';
+  h.fake.code = 400;
+  h.fake.errorBody = { type: 'invalid_request_error', code: 'unknown_parameter', message: `${sensitive} ${sdp}`,
+    param: sensitive, request_id: sensitive };
+  let response = await start(await prepare());
+  assert.equal(response.status, 502);
+  assert.deepEqual(JSON.parse(response.body), { state: 'rejected' });
+  assert.deepEqual(h.running().store.unclosed(h.time(0)), []);
+  h.fake.code = 403;
+  h.fake.errorBody = { type: sensitive, code: sensitive };
+  response = await start(await prepare());
+  assert.equal(response.status, 502);
+  assert.deepEqual(JSON.parse(response.body), { state: 'rejected' });
+  assert.deepEqual(logs, [
+    'voice-bridge: Live WebRTC create failed http=400 type=invalid_request_error code=unknown_parameter\n',
+    'voice-bridge: Live WebRTC create failed http=403\n',
+  ]);
+  h.fake.code = 201;
+  const first = await prepare();
+  assert.equal((await start(first)).status, 201);
+  assert.equal((await post('/api/end', { permit: first })).status, 204);
+  const second = await prepare();
+  assert.equal((await start(second)).status, 201);
+  assert.equal((await post('/api/end', { permit: first })).status, 204); // confirmed old End, no effect on new call
+  assert.equal((await post('/api/lease', { permit: second })).status, 204);
+  assert.equal((await post('/api/end', { permit: second })).status, 204);
+  assert.equal(h.fake.requests.length, 4);
+});
+
+test('an ambiguous trusted-owner start remains visibly locked after reload', async (t) => {
+  const h = await setup(t, { owner: true });
+  const post = (path, data) => h.web(path, { data, headers: ownerHeaders });
+  const { permit } = JSON.parse((await post('/api/prepare', { consent: true })).body);
+  h.fake.code = 500;
+  const response = await post('/api/session', { consent: true, sdp, permit });
+  assert.equal(response.status, 503);
+  assert.deepEqual(JSON.parse(response.body), { state: 'unconfirmed' });
+  assert.equal((await post('/api/owner', {})).status, 423);
+  assert.equal((await post('/api/prepare', { consent: true })).status, 409);
+  await h.stop();
+  await h.launch(true);
+  assert.equal((await post('/api/owner', {})).status, 423);
+  assert.equal(h.fake.requests.length, 1);
+});
+
+test('a healthy web lease keeps a call open past two minutes; a missed heartbeat still ends it', async (t) => {
+  const h = await setup(t, { owner: true });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const post = (path, data) => h.web(path, { data, headers: ownerHeaders });
+  const { permit } = JSON.parse((await post('/api/prepare', { consent: true })).body);
+  assert.equal((await post('/api/session', { consent: true, sdp, permit })).status, 201);
+  for (let i = 0; i < 27; i++) {
+    t.mock.timers.tick(5000);
+    h.time(5000);
+    assert.equal(h.running().bridge.touchOwnerWeb(permit), true); // same method as live /api/lease
+  }
+  assert.equal(h.fake.events.some(({ type }) => type === 'session.close'), false);
+  t.mock.timers.tick(20_001);
+  await h.running().bridge.call.ending;
+  assert.equal(h.fake.events.filter(({ type }) => type === 'session.close').length, 1);
+  assert.deepEqual(h.running().store.unclosed(h.time(0)), []);
 });

@@ -39,6 +39,9 @@ function dispose(run, text) {
 const ended = '대화가 끝났어요. 접수된 작업은 계속됩니다.';
 const uncertain = '마이크가 꺼졌어요. 서버의 종료 확인을 받지 못했습니다.';
 const leftPage = '페이지를 벗어나 연결을 닫았어요.';
+const startRejected = 'GPT-Live가 연결 요청을 거절했어요. 대화가 시작되지 않았습니다.';
+const startClosed = '연결을 완료하지 못했어요. 서버에서 대화를 종료했습니다.';
+const startUnconfirmed = '연결 상태를 확인하지 못했어요. 마이크는 꺼졌으며, 서버 확인 전에는 다시 연결할 수 없습니다.';
 function finish(run, reason, unload = false) {
   if (run !== live) return;
   // Stop capturing immediately, but keep the WebRTC connection open briefly
@@ -165,6 +168,15 @@ async function begin() {
     if (!trustedOwner) authorized = false;
     const scope = run.permit ? { permit: run.permit } : {};
     const response = await post('/api/session', { sdp: peer.localDescription.sdp, consent: true, ...scope }, { signal: run.abort.signal });
+    if (response.status === 502 || response.status === 503) {
+      const detail = await response.json().catch(() => null);
+      const state = detail?.state;
+      if (state === 'rejected' || state === 'closed' || state === 'unconfirmed') {
+        if (state === 'unconfirmed') authorized = false;
+        dispose(run, state === 'rejected' ? startRejected : state === 'closed' ? startClosed : startUnconfirmed);
+        return; // The bridge already resolved/recorded the outcome; no redundant End.
+      }
+    }
     if (response.status === 409 || response.status === 429) {
       dispose(run, '지금은 연결할 수 없어요. 잠시 후 다시 시작해 주세요.'); return;
     }
@@ -202,7 +214,11 @@ async function authorize() {
   }
   try {
     if (match) authorized = (await post('/api/invite', { invite: match[1] })).status === 204;
-    else trustedOwner = authorized = (await post('/api/owner', {})).status === 204;
+    else {
+      const response = await post('/api/owner', {});
+      if (response.status === 423) { message('이전 연결의 종료를 확인 중이에요. 서버 확인 전에는 다시 시작할 수 없습니다.'); return; }
+      trustedOwner = authorized = response.status === 204;
+    }
   } catch { /* remain disarmed */ }
   message(authorized ? '시작하면 마이크가 켜지고 AI와 연결돼요.'
     : match ? '초대가 만료됐거나 이미 사용됐어요.' : '개인 링크 또는 비공개 접속 권한을 확인해 주세요.');

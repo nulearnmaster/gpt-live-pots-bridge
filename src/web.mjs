@@ -128,7 +128,9 @@ export function webServer(bridge, gate = null) {
       if (!data) { reply(res, 400); return; }
       const keys = Object.keys(data);
       if (gate) {
-        if (req.url === '/api/owner') { reply(res, keys.length ? 400 : 204); return; }
+        if (req.url === '/api/owner') {
+          reply(res, keys.length ? 400 : bridge.ownerWebAwaitingRecovery() ? 423 : 204); return;
+        }
         if (req.url === '/api/prepare') {
           if (keys.length !== 1 || data.consent !== true) { reply(res, 400); return; }
           const permit = bridge.prepareOwnerWeb();
@@ -149,14 +151,19 @@ export function webServer(bridge, gate = null) {
         reply(res, 204, '', { 'Set-Cookie': `${cookieName}=${grant}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=240` });
       } else if (req.url === '/api/session') {
         if (keys.length !== (gate ? 3 : 2) || data.consent !== true || !validSDP(data.sdp)) { reply(res, 400); return; }
-        const answer = await (gate ? bridge.startOwnerWeb(data.permit, data.sdp) : bridge.startWeb(cookie, data.sdp));
-        if (!answer) { reply(res, 409); return; }
+        const result = await (gate ? bridge.startOwnerWeb(data.permit, data.sdp) : bridge.startWeb(cookie, data.sdp));
+        if (!result) { reply(res, 409); return; }
+        if (result.state) {
+          reply(res, result.state === 'unconfirmed' ? 503 : 502, JSON.stringify({ state: result.state }),
+            { 'Content-Type': 'application/json' });
+          return;
+        }
         if (res.destroyed) {
           await (gate ? bridge.endOwnerWeb(data.permit) : bridge.endWeb(cookie));
           return;
         }
         // Do not forward the provider session ID, credentials, headers or JSON.
-        reply(res, 201, JSON.stringify({ sdp: answer }), { 'Content-Type': 'application/json' });
+        reply(res, 201, JSON.stringify({ sdp: result.sdp }), { 'Content-Type': 'application/json' });
       } else {
         if (keys.length) { reply(res, 400); return; }
         if (req.url === '/api/lease') { reply(res, bridge.touchWeb(cookie) ? 204 : 409); return; }
