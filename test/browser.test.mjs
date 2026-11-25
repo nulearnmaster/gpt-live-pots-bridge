@@ -27,10 +27,13 @@ function localPeers() {
   const gum = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
   const play = HTMLMediaElement.prototype.play;
   const state = window.fixture = { requests: [], micAttempts: 0, clientData: 0, playAttempts: 0 };
+  Object.defineProperty(document, 'hidden', { get: () => Boolean(state.hidden) });
   navigator.mediaDevices.getUserMedia = async (...args) => {
     state.micAttempts++;
     if (state.rejectMicrophone) throw new DOMException('fixture mic permission', 'NotAllowedError');
-    return state.phoneStream = await gum(...args);
+    const stream = state.phoneStream = await gum(...args);
+    if (state.holdMic) await new Promise((resolve) => { state.releaseMic = resolve; });
+    return stream;
   };
   HTMLMediaElement.prototype.play = function () {
     if (this.id === 'audio' && ++state.playAttempts === 1) return Promise.reject(new DOMException('fixture autoplay', 'NotAllowedError'));
@@ -38,6 +41,10 @@ function localPeers() {
   };
   window.RTCPeerConnection = class PhonePeer extends NativePeer {
     constructor() { super(); state.phone = this; }
+    async setLocalDescription(description) {
+      await super.setLocalDescription(description);
+      if (state.holdOffer) await new Promise((resolve) => { state.releaseOffer = resolve; });
+    }
   };
   window.fetch = async (path, options) => {
     const body = JSON.parse(options.body);
@@ -68,7 +75,7 @@ function localPeers() {
   };
 }
 
-test('optional Chromium fixture: consent and mic permission, simultaneous RTP, fallback playback, and mic stops',
+test('optional Chromium fixture: consent, hidden-page mic/offer cancellation, simultaneous RTP, fallback playback, and mic stops',
   { skip: !binary, timeout: 25_000 }, async (t) => {
     const dir = mkdtempSync(join(tmpdir(), 'voice-chromium-'));
     const child = spawn(binary, ['--headless=new', `--user-data-dir=${dir}`, '--remote-debugging-port=0',
@@ -138,10 +145,29 @@ test('optional Chromium fixture: consent and mic permission, simultaneous RTP, f
     await tap('#start');
     await waitFor(() => js("document.querySelector('#status').textContent.includes('마이크를 허용한 후')"));
     assert.equal(await js('fixture.requests.map(([path]) => path).join()'), '/api/invite');
-    await js('fixture.rejectMicrophone = false');
+    await js('fixture.rejectMicrophone = false; fixture.holdMic = true');
+    await tap('#start');
+    await waitFor(() => js('!!fixture.releaseMic'));
+    // Model the browser moving to the background while its permission/media
+    // promise is pending. Its eventual stream must still have every track stopped.
+    await js("fixture.hidden = true; document.dispatchEvent(new Event('visibilitychange'))");
+    assert.equal(await js("document.querySelector('#end').hidden"), true);
+    await js('fixture.releaseMic()');
+    await waitFor(() => js("fixture.phoneStream.getTracks().every((track) => track.readyState === 'ended')"));
+    assert.equal(await js('fixture.requests.map(([path]) => path).join()'), '/api/invite');
+    await js("fixture.hidden = false; fixture.holdMic = false; fixture.holdOffer = true; document.dispatchEvent(new Event('visibilitychange'))");
+    assert.equal(await js('fixture.micAttempts'), 2); // no automatic restart
+    await tap('#start');
+    await waitFor(() => js('!!fixture.releaseOffer'));
+    // Also check the independent pre-POST gate when the visibility event has
+    // not yet been dispatched during ICE/offer handling.
+    await js('fixture.hidden = true; fixture.releaseOffer()');
+    await waitFor(() => js("fixture.phone.connectionState === 'closed'"));
+    assert.equal(await js('fixture.requests.map(([path]) => path).join()'), '/api/invite');
+    await js('fixture.hidden = false; fixture.holdOffer = false');
     await tap('#start');
     await waitFor(() => js("document.documentElement.hasAttribute('data-live')"));
-    assert.equal(await js('fixture.micAttempts'), 2);
+    assert.equal(await js('fixture.micAttempts'), 4);
     await waitFor(() => js("!document.querySelector('#play').hidden"));
     await tap('#play');
     await waitFor(() => js("document.querySelector('#play').hidden"));

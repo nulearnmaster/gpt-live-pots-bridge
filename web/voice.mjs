@@ -37,6 +37,7 @@ function dispose(run, text) {
 }
 const ended = '대화가 끝났어요. 접수된 작업은 계속됩니다.';
 const uncertain = '마이크가 꺼졌어요. 서버의 종료 확인을 받지 못했습니다.';
+const leftPage = '페이지를 벗어나 연결을 닫았어요.';
 function finish(run, reason, unload = false) {
   if (run !== live) return;
   // Stop capturing immediately, but keep the WebRTC connection open briefly
@@ -44,6 +45,8 @@ function finish(run, reason, unload = false) {
   stopTracks(run.mic);
   if (run.closing) { if (unload) dispose(run, uncertain); return; }
   run.closing = true;
+  audio.pause();
+  audio.srcObject = null;
   run.abort.abort();
   clearTimeout(run.setupTimer);
   clearInterval(run.leaseTimer);
@@ -55,7 +58,12 @@ function finish(run, reason, unload = false) {
     if (res.status === 204) dispose(run, reason || ended);
     else if (res.status !== 401) dispose(run, uncertain);
   }).catch(() => dispose(run, uncertain));
-  if (unload) dispose(run, '페이지를 벗어나 연결을 닫았어요.');
+  if (unload) dispose(run, leftPage);
+}
+function foreground(run) {
+  if (run !== live || run.closing) return false;
+  if (document.hidden) { finish(run, leftPage); return false; }
+  return true;
 }
 function waitForICE(peer, signal) {
   if (peer.iceGatheringState === 'complete') return Promise.resolve();
@@ -75,28 +83,28 @@ function waitForICE(peer, signal) {
   });
 }
 function ready(run) {
-  if (run !== live || run.closing || run.ready || !run.started || run.peer.connectionState !== 'connected') return;
+  if (!foreground(run) || run.ready || !run.started || run.peer.connectionState !== 'connected') return;
   run.ready = true;
   clearTimeout(run.setupTimer);
   for (const track of run.mic.getAudioTracks()) track.enabled = true;
   message(run.playBlocked ? '연결됐어요. 소리를 켜 주세요.' : '연결됐어요. 바로 말씀하세요.');
 }
 async function play(run) {
-  if (run !== live || run.closing || !audio.srcObject) return;
+  if (!foreground(run) || !audio.srcObject) return;
   try {
     // For a blocked autoplay, this is called synchronously from the Play tap.
     await audio.play();
-    if (run !== live || run.closing) return;
+    if (!foreground(run)) return;
     run.playBlocked = false;
     if (run.ready) message('연결됐어요. 바로 말씀하세요.'); else layout();
   } catch {
-    if (run !== live || run.closing) return;
+    if (!foreground(run)) return;
     run.playBlocked = true;
     message('소리가 자동으로 재생되지 않았어요. 소리를 켜 주세요.');
   }
 }
 async function begin() {
-  if (live || !invited) return;
+  if (live || !invited || document.hidden) return;
   const run = { abort: new AbortController() };
   live = run;
   message('마이크 접근을 허용해 주세요…');
@@ -105,7 +113,7 @@ async function begin() {
     // The explicit cost-and-start tap calls getUserMedia before the first await;
     // there is no automatic microphone request, recording or turn upload.
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-    if (run !== live || run.closing) { stopTracks(stream); return; }
+    if (!foreground(run)) { stopTracks(stream); return; }
     run.mic = stream;
     message('음성을 연결하는 중…');
     const peer = new RTCPeerConnection();
@@ -116,7 +124,7 @@ async function begin() {
       track.addEventListener('ended', () => finish(run, '마이크 연결이 끊어졌어요.'));
     }
     peer.addEventListener('track', (event) => {
-      if (run !== live || run.closing || event.track.kind !== 'audio') return;
+      if (!foreground(run) || event.track.kind !== 'audio') return;
       audio.srcObject = new MediaStream([event.track]);
       void play(run);
     });
@@ -140,15 +148,15 @@ async function begin() {
     });
     await peer.setLocalDescription(await peer.createOffer());
     await waitForICE(peer, run.abort.signal);
-    if (run !== live || run.closing) return;
+    if (!foreground(run)) return; // A billable POST must never start from a hidden page.
     run.sentOffer = true;
     invited = false;
     const response = await post('/api/session', { sdp: peer.localDescription.sdp, consent: true }, { signal: run.abort.signal });
     if (!response.ok) throw Error('unable to initiate session');
     const { sdp } = await response.json();
-    if (run !== live || run.closing) return;
+    if (!foreground(run)) return;
     await peer.setRemoteDescription({ type: 'answer', sdp });
-    if (run !== live || run.closing) return;
+    if (!foreground(run)) return;
     run.leaseTimer = setInterval(async () => {
       try {
         const reply = await post('/api/lease', {}, { signal: run.abort.signal });
@@ -167,7 +175,7 @@ endButton.addEventListener('click', () => { if (live) finish(live); });
 playButton.addEventListener('click', () => void play(live));
 addEventListener('pagehide', () => { if (live) finish(live, '', true); });
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden && live?.sentOffer) finish(live, '페이지를 벗어나 연결을 닫았어요.');
+  if (document.hidden && live) finish(live, leftPage);
 });
 
 async function authorize() {
