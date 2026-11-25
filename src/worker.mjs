@@ -38,7 +38,7 @@ export function potsSink({ binary, bot, address }) {
     else if (kind === 'send') args = ['send', '--bot', bot, '--id', `voice-result-${id}`, address, '-'];
     else throw Error('invalid operation');
     const env = { ...process.env };
-    for (const key of ['OPENAI_API_KEY', 'OPENAI_WEBHOOK_SECRET', 'POTS_CHILD', 'POTS_FROM']) delete env[key];
+    for (const key of ['OPENAI_API_KEY', 'OPENAI_WEBHOOK_SECRET', 'VOICE_WEB_PROXY_KEY', 'POTS_CHILD', 'POTS_FROM']) delete env[key];
     const stdout = await run(binary, args, env, kind === 'send' ? text : undefined);
     const result = JSON.parse(stdout);
     if (kind === 'wake' && (!Number.isSafeInteger(result?.id) || result.note !== text)) throw Error('wake not confirmed');

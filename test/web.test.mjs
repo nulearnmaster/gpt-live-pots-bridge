@@ -12,11 +12,13 @@ import { Bridge } from '../src/bridge.mjs';
 import { openAI } from '../src/openai.mjs';
 import { listen, listenLocal, localRequest, localServer, stopServer } from '../src/server.mjs';
 import { Store } from '../src/store.mjs';
-import { webServer } from '../src/web.mjs';
+import { trustedOwnerConfig, webServer } from '../src/web.mjs';
 import { potsSink, workOnce } from '../src/worker.mjs';
 
 const origin = 'https://owner.example.invalid';
 const key = 'fixture-unusable-key';
+const ownerHeaders = { 'X-Voice-Owner': 'owner@example.invalid', 'X-Voice-Proxy-Key': 'A'.repeat(43) };
+const fixtureGate = trustedOwnerConfig(ownerHeaders['X-Voice-Owner'], ownerHeaders['X-Voice-Proxy-Key']);
 // Structural SDP only; intentionally no real microphone, ICE or audio peer.
 const sdp = 'v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n';
 const answer = `${sdp}a=setup:active\r\n`;
@@ -78,7 +80,7 @@ async function fakeLive() {
   return state;
 }
 
-async function setup(t, { legacy = false } = {}) {
+async function setup(t, { legacy = false, owner = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'web-bridge-'));
   const dbPath = join(dir, 'queue.sqlite');
   const workerPath = join(dir, 'worker.sock');
@@ -97,8 +99,8 @@ async function setup(t, { legacy = false } = {}) {
   let running;
   async function launch(recover = false) {
     const store = new Store(dbPath);
-    const bridge = new Bridge({ store, provider: fake.provider, webOrigin: origin, clock: () => now });
-    const web = await listen(webServer(bridge), { host: '127.0.0.1', port: 0 });
+    const bridge = new Bridge({ store, provider: fake.provider, webOrigin: origin, trustedWebOwner: owner, clock: () => now });
+    const web = await listen(webServer(bridge, owner ? fixtureGate : null), { host: '127.0.0.1', port: 0 });
     const worker = await listenLocal(localServer(bridge), workerPath, 0o600);
     const admin = await listenLocal(localServer(bridge, true), adminPath, 0o600);
     running = { store, bridge, web, worker, admin };
@@ -331,4 +333,79 @@ test('latch a same-session final frame arriving between End and the cleanup list
   assert.deepEqual(store.unclosed(0), []);
   assert.equal(h.fake.events.filter(({ type }) => type === 'session.close').length, 0);
   assert.ok(await h.invite());
+});
+
+test('trusted bookmark mode denies raw/spoofed loopback on every route and never charges merely opening root', async (t) => {
+  const h = await setup(t, { owner: true });
+  for (const path of ['/', '/voice.mjs', '/voice.css', '/api/owner', '/api/prepare', '/api/session', '/api/lease', '/api/end']) {
+    const method = path.startsWith('/api') ? 'POST' : 'GET';
+    assert.equal((await h.web(path, { method })).status, 403);
+    assert.equal((await h.web(path, { method, headers: { 'X-Voice-Owner': ownerHeaders['X-Voice-Owner'] } })).status, 403);
+  }
+  for (const headers of [
+    { 'X-Voice-Owner': 'wrong@example.invalid' }, { 'X-Voice-Proxy-Key': 'Z'.repeat(43) },
+    { 'X-Voice-Owner': [ownerHeaders['X-Voice-Owner'], ownerHeaders['X-Voice-Owner']] },
+    { 'X-Voice-Proxy-Key': [ownerHeaders['X-Voice-Proxy-Key'], ownerHeaders['X-Voice-Proxy-Key']] },
+    { Origin: 'https://other.invalid' }, { 'X-Forwarded-Proto': 'http' }, { Host: 'other.invalid' }, { 'Sec-Fetch-Site': 'cross-site' },
+  ]) assert.equal((await h.web('/api/owner', { headers: { ...ownerHeaders, ...headers } })).status, 403);
+  const page = await h.web('/', { method: 'GET', headers: ownerHeaders });
+  assert.equal(page.status, 200);
+  assert.equal(page.headers['set-cookie'], undefined);
+  assert.match(page.body, /비용에 동의하고 시작/);
+  assert(!page.body.includes(ownerHeaders['X-Voice-Proxy-Key']));
+  const post = (path, data) => h.web(path, { data, headers: ownerHeaders });
+  const status = await post('/api/owner', {});
+  assert.equal(status.status, 204);
+  assert.equal(status.headers['set-cookie'], undefined);
+  await assert.rejects(h.admin('/invite-web'), /409/);
+  assert.equal((await post('/api/invite', {})).status, 404);
+  assert.equal((await post('/api/prepare', { consent: false })).status, 400);
+  assert.equal((await post('/api/session', { consent: true, sdp })).status, 400);
+  assert.equal((await post('/api/session', { consent: true, sdp, permit: 'Z'.repeat(43) })).status, 409);
+  assert.equal(h.fake.requests.length, 0);
+});
+
+test('bookmark works on restart without cookies; short permits are consent-bound, scoped, cancellable and single-use', async (t) => {
+  const h = await setup(t, { owner: true });
+  const post = (path, data) => h.web(path, { data, headers: ownerHeaders });
+  const prepare = async () => {
+    const response = await post('/api/prepare', { consent: true });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers['set-cookie'], undefined);
+    return JSON.parse(response.body).permit;
+  };
+  const start = (permit) => post('/api/session', { consent: true, sdp, permit });
+  const stale = await prepare();
+  assert.equal((await post('/api/end', { permit: stale })).status, 204);
+  assert.equal((await start(stale)).status, 409);
+  const expired = await prepare();
+  h.time(15_001);
+  assert.equal((await start(expired)).status, 409);
+  const lostOnRestart = await prepare();
+  await h.stop();
+  await h.launch(true);
+  assert.equal((await h.web('/', { method: 'GET', headers: ownerHeaders })).status, 200);
+  assert.equal((await post('/api/owner', {})).status, 204);
+  assert.equal((await start(lostOnRestart)).status, 409);
+  assert.equal(h.fake.requests.length, 0);
+  const current = await prepare();
+  assert.equal((await post('/api/session', { consent: false, sdp, permit: current })).status, 400);
+  const attempts = await Promise.all([start(current), start(current)]);
+  assert.deepEqual(attempts.map((r) => r.status).sort(), [201, 409]);
+  assert.equal((await post('/api/end', { permit: stale })).status, 409);
+  assert.equal((await post('/api/lease', { permit: stale })).status, 409);
+  assert.equal((await post('/api/lease', { permit: current })).status, 204);
+  assert.equal((await post('/api/prepare', { consent: true })).status, 409);
+  assert.equal((await post('/api/end', { permit: current })).status, 204);
+  const cooldown = await prepare();
+  assert.equal((await start(cooldown)).status, 409);
+  h.time(30_001);
+  await h.admin('/arm');
+  assert.equal((await post('/api/prepare', { consent: true })).status, 409);
+  h.time(120_001);
+  // SIP arm expiry timer normally uses wall time; restart to clear fixture's in-memory arm.
+  await h.stop();
+  await h.launch(true);
+  assert.equal((await start(await prepare())).status, 201);
+  assert.equal(h.fake.requests.length, 2);
 });

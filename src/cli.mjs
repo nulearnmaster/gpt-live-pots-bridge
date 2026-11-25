@@ -4,7 +4,7 @@ import { Bridge } from './bridge.mjs';
 import { Store } from './store.mjs';
 import { openAI, signingKey } from './openai.mjs';
 import { listen, listenLocal, localRequest, localServer, publicServer, requirePrivateDirectory, stopServer } from './server.mjs';
-import { webServer } from './web.mjs';
+import { trustedOwnerConfig, webServer } from './web.mjs';
 import { tasks, isPreset, receiptPattern } from './policy.mjs';
 import { potsSink, workOnce } from './worker.mjs';
 
@@ -24,7 +24,8 @@ function port(value) {
   if (!Number.isInteger(parsed) || parsed < 1024 || parsed > 65535) throw Error('invalid port');
   return parsed;
 }
-async function serve({ sip, web }) {
+async function serve({ sip, web, owner }) {
+  const gate = owner ? trustedOwnerConfig(env.VOICE_WEB_OWNER_LOGIN, env.VOICE_WEB_PROXY_KEY) : null;
   const sipPort = sip ? port(env.VOICE_WEBHOOK_PORT ?? '8788') : null;
   const webPort = web ? port(env.VOICE_WEB_PORT ?? '8789') : null;
   if (sip && web && sipPort === webPort) throw Error('configure separate transport ports');
@@ -37,7 +38,7 @@ async function serve({ sip, web }) {
   requirePrivateDirectory(env.VOICE_ADMIN_SOCKET, true);
   requirePrivateDirectory(env.VOICE_WORKER_SOCKET);
   const store = new Store(env.VOICE_STATE_DB);
-  const bridge = new Bridge({ store, provider: openAI(env.OPENAI_API_KEY, { webVoice: web ? env.VOICE_WEB_VOICE : undefined }), linkOrigin, webOrigin });
+  const bridge = new Bridge({ store, provider: openAI(env.OPENAI_API_KEY, { webVoice: web ? env.VOICE_WEB_VOICE : undefined }), linkOrigin, webOrigin, trustedWebOwner: owner });
   const servers = [];
   let stopping;
   let maintenance;
@@ -49,7 +50,7 @@ async function serve({ sip, web }) {
   })();
   try {
     if (sip) servers.push(await listen(publicServer(bridge, key), { host: '127.0.0.1', port: sipPort }));
-    if (web) servers.push(await listen(webServer(bridge), { host: '127.0.0.1', port: webPort }));
+    if (web) servers.push(await listen(webServer(bridge, gate), { host: '127.0.0.1', port: webPort }));
     servers.push(await listenLocal(localServer(bridge), env.VOICE_WORKER_SOCKET, env.VOICE_SHARED_GROUP === 'yes' ? 0o660 : 0o600));
     servers.push(await listenLocal(localServer(bridge, true), env.VOICE_ADMIN_SOCKET, 0o600));
     const purge = () => { try { store.purge(Date.now()); } catch { complain('state cleanup failed'); } };
@@ -101,7 +102,10 @@ async function main(args) {
     const flags = args.slice(1);
     const sip = flags.includes('--enable-paid-sip');
     const web = flags.includes('--enable-paid-webrtc');
-    if ((sip || web) && flags.length === Number(sip) + Number(web)) return serve({ sip, web });
+    const owner = flags.includes('--enable-trusted-web-owner');
+    if ((sip || web) && (!owner || web) && flags.length === Number(sip) + Number(web) + Number(owner)) {
+      return serve({ sip, web, owner });
+    }
   }
   if (command === 'worker' && arg === '--enable-pots-effects' && args.length === 2) return worker();
   if (command === 'arm' && args.length === 1 && process.stdout.isTTY) return print(await localRequest(env.VOICE_ADMIN_SOCKET, '/arm'));
@@ -116,7 +120,7 @@ async function main(args) {
     if (command === 'complete') return print(await local('/complete', { ...await readResult(), id: arg }));
     if (command === 'fail') return print(await local('/fail', { id: arg }));
   }
-  complain('usage: serve --enable-paid-sip and/or --enable-paid-webrtc | worker --enable-pots-effects | arm or invite-web (TTY only) | list | claim ID | complete ID (JSON stdin) | fail ID');
+  complain('usage: serve --enable-paid-sip and/or --enable-paid-webrtc [--enable-trusted-web-owner] | worker --enable-pots-effects | arm or invite-web (TTY only) | list | claim ID | complete ID (JSON stdin) | fail ID');
   process.exitCode = 2;
 }
 main(process.argv.slice(2)).catch(() => { complain('command failed; check local setup, permissions, input and receipt state'); process.exitCode = 1; });

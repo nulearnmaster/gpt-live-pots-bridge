@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { validSDP } from './openai.mjs';
@@ -12,7 +13,21 @@ const headers = {
   'Cross-Origin-Resource-Policy': 'same-origin', 'X-Frame-Options': 'DENY',
 };
 const maxBody = 64 * 1024;
-const postPaths = ['/api/invite', '/api/session', '/api/lease', '/api/end'];
+const postPaths = ['/api/session', '/api/lease', '/api/end'];
+const trustedLoginPattern = /^[A-Za-z0-9._+@-]{1,254}$/;
+const proxyKeyPattern = /^[A-Za-z0-9_-]{43}$/;
+export function trustedOwnerConfig(login, key) {
+  if (typeof login !== 'string' || !trustedLoginPattern.test(login) || typeof key !== 'string' || !proxyKeyPattern.test(key)) {
+    throw Error('configure a pinned owner login and 32-byte base64url proxy key');
+  }
+  return { login, key: Buffer.from(key) };
+}
+function fromTrustedGate(req, gate) {
+  const supplied = req.headers['x-voice-proxy-key'];
+  return req.socket.remoteAddress === '127.0.0.1' && req.headersDistinct['x-voice-owner']?.length === 1 &&
+    req.headers['x-voice-owner'] === gate.login && req.headersDistinct['x-voice-proxy-key']?.length === 1 &&
+    typeof supplied === 'string' && proxyKeyPattern.test(supplied) && timingSafeEqual(Buffer.from(supplied), gate.key);
+}
 
 function reply(res, status, body = '', more = {}) {
   if (res.destroyed) return;
@@ -57,9 +72,11 @@ async function readBody(req, res, limit) {
 }
 
 // Only bind this listener to loopback behind an owner-only TLS reverse proxy.
-// Neither the proxy headers nor Origin authenticate anyone; only the invitation
-// and its scoped cookie do. Never co-host other apps under this exact origin.
-export function webServer(bridge) {
+// Origin/Host alone do not authenticate. Default mode uses an invitation and
+// scoped cookie; the explicit owner mode trusts only the proven private gate.
+// Never co-host other apps under this exact origin.
+export function webServer(bridge, gate = null) {
+  if (Boolean(gate) !== bridge.trustedWebOwner) throw Error('trusted web gate mode mismatch');
   const { webOrigin } = bridge;
   if (!webOrigin) throw Error('configure web origin');
   const origin = new URL(webOrigin);
@@ -69,6 +86,7 @@ export function webServer(bridge) {
     ['/voice.css', ['voice.css', 'text/css; charset=utf-8']],
     ['/voice.mjs', ['voice.mjs', 'text/javascript; charset=utf-8']],
   ].map(([path, [name, type]]) => [path, { body: readFileSync(new URL(`../web/${name}`, import.meta.url)), type }]));
+  const extraPaths = gate ? ['/api/owner', '/api/prepare'] : ['/api/invite'];
   const acceptInvite = bucket(6, 4000);
   const acceptUnauthenticated = bucket(24, 500);
   const acceptAuthorized = bucket(12, 500);
@@ -79,6 +97,7 @@ export function webServer(bridge) {
           req.headersDistinct['x-forwarded-proto']?.length !== 1 || req.headers['x-forwarded-proto'] !== 'https') {
         reply(res, 403); return;
       }
+      if (gate && !fromTrustedGate(req, gate)) { reply(res, 403); return; }
       if (req.method === 'GET') {
         if (!acceptUnauthenticated()) { reply(res, 429); return; }
         const asset = assets.get(req.url);
@@ -86,7 +105,7 @@ export function webServer(bridge) {
         reply(res, 200, asset.body, { 'Content-Type': asset.type }); return;
       }
       if (req.method !== 'POST') { reply(res, 405); return; }
-      if (!postPaths.includes(req.url)) { reply(res, 404); return; }
+      if (!postPaths.includes(req.url) && !extraPaths.includes(req.url)) { reply(res, 404); return; }
       if (req.headersDistinct.origin?.length !== 1 || req.headers.origin !== webOrigin ||
           (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin')) {
         reply(res, 403); return;
@@ -94,11 +113,11 @@ export function webServer(bridge) {
       if (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] ?? '') || req.headers['content-encoding']) {
         reply(res, 415); return;
       }
-      const cookie = ownerCookie(req);
+      const cookie = gate ? undefined : ownerCookie(req);
       if (req.url === '/api/invite') {
         if (!acceptInvite()) { reply(res, 429); return; }
       } else {
-        if (!bridge.hasWebAuth(cookie)) {
+        if (!gate && !bridge.hasWebAuth(cookie)) {
           reply(res, acceptUnauthenticated() ? 401 : 429); return;
         }
         // End remains available after legitimate request-bucket exhaustion.
@@ -108,15 +127,34 @@ export function webServer(bridge) {
       if (res.headersSent || res.destroyed) return;
       if (!data) { reply(res, 400); return; }
       const keys = Object.keys(data);
+      if (gate) {
+        if (req.url === '/api/owner') { reply(res, keys.length ? 400 : 204); return; }
+        if (req.url === '/api/prepare') {
+          if (keys.length !== 1 || data.consent !== true) { reply(res, 400); return; }
+          const permit = bridge.prepareOwnerWeb();
+          if (!permit) { reply(res, 409); return; }
+          reply(res, 200, JSON.stringify({ permit }), { 'Content-Type': 'application/json' }); return;
+        }
+        if (typeof data.permit !== 'string' || !proxyKeyPattern.test(data.permit)) { reply(res, 400); return; }
+        if (req.url === '/api/lease' || req.url === '/api/end') {
+          if (keys.length !== 1) { reply(res, 400); return; }
+          if (req.url === '/api/lease') { reply(res, bridge.touchOwnerWeb(data.permit) ? 204 : 409); return; }
+          const ended = await bridge.endOwnerWeb(data.permit);
+          reply(res, ended === true ? 204 : ended === false ? 503 : 409); return;
+        }
+      }
       if (req.url === '/api/invite') {
         const grant = keys.length === 1 && bridge.redeemWeb(data.invite);
         if (!grant) { reply(res, 401); return; }
         reply(res, 204, '', { 'Set-Cookie': `${cookieName}=${grant}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=240` });
       } else if (req.url === '/api/session') {
-        if (keys.length !== 2 || data.consent !== true || !validSDP(data.sdp)) { reply(res, 400); return; }
-        const answer = await bridge.startWeb(cookie, data.sdp);
+        if (keys.length !== (gate ? 3 : 2) || data.consent !== true || !validSDP(data.sdp)) { reply(res, 400); return; }
+        const answer = await (gate ? bridge.startOwnerWeb(data.permit, data.sdp) : bridge.startWeb(cookie, data.sdp));
         if (!answer) { reply(res, 409); return; }
-        if (res.destroyed) { await bridge.endWeb(cookie); return; }
+        if (res.destroyed) {
+          await (gate ? bridge.endOwnerWeb(data.permit) : bridge.endWeb(cookie));
+          return;
+        }
         // Do not forward the provider session ID, credentials, headers or JSON.
         reply(res, 201, JSON.stringify({ sdp: answer }), { 'Content-Type': 'application/json' });
       } else {

@@ -26,7 +26,7 @@ function localPeers() {
   const NativePeer = window.RTCPeerConnection;
   const gum = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
   const play = HTMLMediaElement.prototype.play;
-  const state = window.fixture = { requests: [], micAttempts: 0, clientData: 0, playAttempts: 0 };
+  const state = window.fixture = { requests: [], micAttempts: 0, clientData: 0, playAttempts: 0, prepares: 0 };
   Object.defineProperty(document, 'hidden', { get: () => Boolean(state.hidden) });
   navigator.mediaDevices.getUserMedia = async (...args) => {
     state.micAttempts++;
@@ -49,7 +49,14 @@ function localPeers() {
   window.fetch = async (path, options) => {
     const body = JSON.parse(options.body);
     state.requests.push([path, body]);
-    if (path === '/api/invite' || path === '/api/lease') return new Response(null, { status: 204 });
+    if (path === '/api/invite' || path === '/api/owner') return new Response(null, { status: 204 });
+    if (path === '/api/prepare') {
+      if (body.consent !== true) throw Error('missing consent');
+      state.permit = String(++state.prepares).padStart(43, 'A');
+      return new Response(JSON.stringify({ permit: state.permit }), { status: 200 });
+    }
+    if (state.permit && body.permit !== state.permit) throw Error('wrong active permit');
+    if (path === '/api/lease') return new Response(null, { status: 204 });
     if (path === '/api/end') {
       if (state.events?.readyState === 'open') state.events.send('{"type":"session.closed"}');
       state.remote?.close();
@@ -75,7 +82,7 @@ function localPeers() {
   };
 }
 
-test('optional Chromium fixture: consent, hidden-page mic/offer cancellation, simultaneous RTP, fallback playback, and mic stops',
+test('optional Chromium fixture: stable bookmark, consent, hidden-page cancellation, bidirectional RTP and mic cleanup',
   { skip: !binary, timeout: 25_000 }, async (t) => {
     const dir = mkdtempSync(join(tmpdir(), 'voice-chromium-'));
     const child = spawn(binary, ['--headless=new', `--user-data-dir=${dir}`, '--remote-debugging-port=0',
@@ -182,4 +189,21 @@ test('optional Chromium fixture: consent, hidden-page mic/offer cancellation, si
     assert.equal(await js("document.querySelector('#status').textContent.includes('접수된 작업은 계속')"), true);
     assert(await js("fixture.phoneStream.getTracks().every((track) => track.readyState === 'ended')"));
     assert.equal(await js("fixture.requests.filter(([p]) => p === '/api/end').length"), 1);
+    // The bare bookmark opens without a fragment, registration, or cookie.
+    await call('Page.reload');
+    await waitFor(() => js("!!fixture && fixture.requests[0]?.[0] === '/api/owner' && !document.querySelector('#start').disabled"));
+    assert.equal(await js('fixture.micAttempts'), 0);
+    assert.equal(await js('fixture.requests.map(([path]) => path).join()'), '/api/owner');
+    assert.equal(await js('document.cookie'), '');
+    for (let i = 0; i < 2; i++) {
+      await tap('#start');
+      await waitFor(() => js("document.documentElement.hasAttribute('data-live')"));
+      await tap('#end');
+      await waitFor(() => js("fixture.phone.connectionState === 'closed' && !document.querySelector('#start').disabled"));
+    }
+    assert.equal(await js('fixture.micAttempts'), 2);
+    assert.deepEqual(await js("fixture.requests.filter(([p]) => p === '/api/session').map(([, body]) => body.consent)"), [true, true]);
+    assert.equal(await js("new Set(fixture.requests.filter(([p]) => p === '/api/session').map(([, body]) => body.permit)).size"), 2);
+    assert.equal(await js('location.hash'), '');
+    assert.equal(await js('document.cookie'), '');
   });

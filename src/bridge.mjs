@@ -20,8 +20,8 @@ const validId = (id) => typeof id === 'string' && idPattern.test(id);
 const logFailure = (kind) => process.stderr.write(`voice-bridge: ${kind}\n`);
 
 export class Bridge {
-  constructor({ store, provider, linkOrigin = null, webOrigin = null, clock = Date.now, code = () => String(randomInt(1e8)).padStart(8, '0') }) {
-    Object.assign(this, { store, provider, linkOrigin, webOrigin, clock, code });
+  constructor({ store, provider, linkOrigin = null, webOrigin = null, trustedWebOwner = false, clock = Date.now, code = () => String(randomInt(1e8)).padStart(8, '0') }) {
+    Object.assign(this, { store, provider, linkOrigin, webOrigin, trustedWebOwner, clock, code });
   }
   blocked() {
     return this.call || this.stopped || this.recovering || this.store.unclosed(this.clock()).length;
@@ -38,7 +38,7 @@ export class Bridge {
     return { digits, expires_at: issued + armMs };
   }
   inviteWeb() {
-    if (!this.webOrigin || this.blocked() || this.grant) return null;
+    if (!this.webOrigin || this.trustedWebOwner || this.blocked() || this.grant) return null;
     const value = token();
     const expires = this.clock() + armMs;
     this.webAuth = null;
@@ -46,22 +46,54 @@ export class Bridge {
     return { url: `${this.webOrigin}/#invite=${value}`, expires_at: expires };
   }
   redeemWeb(invitation) {
-    if (this.blocked() || !this.webOrigin || this.webGrant?.expires <= this.clock() || !matches(this.webGrant, invitation)) return null;
+    if (this.blocked() || !this.webOrigin || this.trustedWebOwner || this.webGrant?.expires <= this.clock() || !matches(this.webGrant, invitation)) return null;
     this.webGrant = null;
     const value = token();
     this.webAuth = verifier(value, this.clock() + armMs);
     return value;
   }
   hasWebAuth(cookie) {
-    return !!(matches(this.webAuth, cookie) && (this.call?.kind === 'webrtc' || this.webAuth.expires > this.clock()));
+    return !this.trustedWebOwner && !!(matches(this.webAuth, cookie) && (this.call?.kind === 'webrtc' || this.webAuth.expires > this.clock()));
   }
-  async startWeb(cookie, sdp) {
-    if (this.blocked() || !this.hasWebAuth(cookie) || !validSDP(sdp)) return null;
+  startWeb(cookie, sdp) {
+    if (!this.hasWebAuth(cookie)) return null;
+    return this.beginWeb(sdp);
+  }
+  beginWeb(sdp, permit = null) {
+    if (this.blocked() || !validSDP(sdp)) return null;
     const attempt = `web_${randomUUID()}`;
     if (!this.store.reserveWeb(attempt, this.clock())) return null;
     const call = new WebCall(this, attempt);
+    call.permit = permit;
     this.call = call;
     return call.start(sdp);
+  }
+  // The owner is authenticated by the private gate on every RPC. The grant
+  // below binds only that tab's current click, not the browser's identity.
+  prepareOwnerWeb() {
+    if (!this.trustedWebOwner || this.blocked() || this.grant) return null;
+    const value = token();
+    this.ownerPermit = verifier(value, this.clock() + 15_000);
+    return value;
+  }
+  startOwnerWeb(value, sdp) {
+    const permit = this.ownerPermit;
+    if (!this.trustedWebOwner || this.grant || this.blocked() || !permit || permit.expires <= this.clock() ||
+        !matches(permit, value) || !validSDP(sdp)) return null;
+    this.ownerPermit = null; // Single use even if the paid create fails.
+    return this.beginWeb(sdp, permit);
+  }
+  touchOwnerWeb(value) {
+    if (!this.trustedWebOwner || !matches(this.call?.permit, value) || this.call.phase === 'closed') return false;
+    this.call.touch();
+    return true;
+  }
+  async endOwnerWeb(value) {
+    if (!this.trustedWebOwner) return null;
+    if (matches(this.call?.permit, value)) return !!(await this.call.end(true));
+    if (!matches(this.ownerPermit, value)) return null;
+    this.ownerPermit = null; // End beat the SDP POST; a late create cannot start.
+    return true;
   }
   touchWeb(cookie) {
     if (!this.hasWebAuth(cookie) || this.call?.kind !== 'webrtc' || this.call.phase === 'closed') return false;
@@ -119,7 +151,7 @@ export class Bridge {
   }
   async stop() {
     this.stopped = true;
-    this.grant = this.webGrant = this.webAuth = null;
+    this.grant = this.webGrant = this.webAuth = this.ownerPermit = null;
     clearTimeout(this.armTimer);
     await this.call?.end(true);
   }

@@ -4,7 +4,7 @@ Talk to **GPT-Live** and let your **existing Pots bot** handle background drafts
 
 | Transport | On your phone | Current verification |
 | --- | --- | --- |
-| **Mobile web (no number)** | Open a private invitation in Safari or Chrome while parked, approve the displayed cost and microphone, then talk hands-free. Browser and GPT-Live stream both directions over WebRTC. | Local protocol fixtures and native Chromium synthetic-mic test; live provider, iOS/Android, Bluetooth, and barge-in need a [parked paid smoke test](docs/web-smoke.md). |
+| **Mobile web (no number)** | Open the owner’s saved private URL or a one-time test invitation in Safari or Chrome while parked, approve the displayed cost and microphone, then talk hands-free. Browser and GPT-Live stream both directions over WebRTC. | Local protocol fixtures and native Chromium synthetic-mic test; live provider, iOS/Android, Bluetooth, and barge-in need a [parked paid smoke test](docs/web-smoke.md). |
 | **Inbound SIP** | Dial the configured SIP number and enter the one-time keypad PIN. | Local signed webhook and SIP control fixtures; real trunk, carrier and handset require the separate [paid SIP smoke](docs/sip-smoke.md). |
 
 Both use the **GPT-Live API with client delegation**, not OpenAI Realtime, clip uploads, speech-to-text turns, or push-to-talk. Hang up or close the page and accepted work still runs; detailed results go only to the same operator-configured private Telegram inbox. This is a single-owner prototype, not a public service. The only presets draft meeting or weekly-review checklists and follow-up **templates**. They do not send mail, run commands, approve actions, or access private records.
@@ -37,7 +37,7 @@ The demo checks that a response is not emitted before the SQLite commit, that a 
 ## How callers use it
 
 1. **While parked**, choose one path:
-   - **Web:** open a fresh personal invitation at the configured private HTTPS origin. Tap **비용에 동의하고 시작** (agree to the cost and start), allow microphone access, and wait for **연결됐어요** (connected). The page discloses the **~US$0.10** Live estimate and two-minute close attempt. Delayed confirmation can add charges and Pots costs are separate. `소리 켜기` (enable sound) appears only if autoplay is blocked. No dialing, push-to-talk, or tap after each request.
+   - **Web:** open your [saved private owner URL](docs/owner-bookmark.md) if that mode is enabled, otherwise open a fresh personal invitation at the configured private HTTPS origin. Tap **비용에 동의하고 시작** (agree to the cost and start), allow microphone access, and wait for **연결됐어요** (connected). The page discloses the **~US$0.10** Live estimate and two-minute close attempt. Delayed confirmation can add charges and Pots costs are separate. `소리 켜기` (enable sound) appears only if autoplay is blocked. No dialing, push-to-talk, or tap after each request.
    - **SIP:** the operator arms one attempt and gets a single-use eight-digit code. Dial within two minutes; wait for the prompt, enter the code with the keypad followed by `#`, and wait for pairing confirmation. Never read the code aloud.
 2. Speak a full request, including its ending marker:
 
@@ -60,7 +60,9 @@ node src/cli.mjs serve --enable-paid-webrtc
 node src/cli.mjs invite-web   # private service-owner TTY; returns one-time URL
 ```
 
-To enable both, run **one** `serve --enable-paid-sip --enable-paid-webrtc` process with two distinct loopback ports. The transports share one call slot and one SQLite queue; issue only one SIP arm or web invitation at a time. The worker is separate and needs its own explicit `--enable-pots-effects` switch regardless of transport.
+For a **stable, bookmarkable URL with no invite or browser registration**, see [trusted owner bookmark mode](docs/owner-bookmark.md). It requires a separately authenticated owner-device HTTPS gate; the default above continues to require a one-time invite. In either mode, opening the page never activates the microphone or starts a paid session.
+
+To enable both transports, run **one** `serve --enable-paid-sip --enable-paid-webrtc` process with two distinct loopback ports. The transports share one call slot and one SQLite queue; issue only one SIP arm or web invitation at a time. The worker is separate and needs its own explicit `--enable-pots-effects` switch regardless of transport.
 
 ## Opt-in real SIP and shared Pots setup
 
@@ -90,7 +92,7 @@ To enable both, run **one** `serve --enable-paid-sip --enable-paid-webrtc` proce
 
 ## Design and limits
 
-- Web uses a one-use, short-lived owner invitation, HTTPS, a bounded same-origin SDP exchange with a fixed Live configuration, and an authenticated sideband. The browser gets an SDP answer, never a provider API key or client secret. It sends no commands on the Live data channel; only the server sideband can send Live commands. End/exit stops the local mic; a missing page heartbeat or pilot timer closes the remote session. If a create or close outcome is ambiguous, the service blocks new sessions rather than retrying a billable create. Follow the [web runbook](docs/web-smoke.md) for reconciliation.
+- Web uses either the one-use invitation or an explicitly configured private owner-device gate, HTTPS, a bounded same-origin SDP exchange with a fixed Live configuration, and an authenticated sideband. The browser gets an SDP answer, never a provider API key or client secret. It sends no commands on the Live data channel; only the server sideband can send Live commands. End/exit stops the local mic; a missing page heartbeat or pilot timer closes the remote session. If a create or close outcome is ambiguous, the service blocks new sessions rather than retrying a billable create. Follow the [web runbook](docs/web-smoke.md) for reconciliation.
 
 - The Live webhook is authenticated over raw bytes (Standard Webhooks HMAC, bounded clock skew) and deduplicated by delivery and Live session IDs. **`From`, `To`, and other SIP headers do not authorize a caller.** The owner-issued, time-limited DTMF challenge proves possession of a one-time code, not the identity of a human. One call can reserve an armed slot. Calls outside that slot are not accepted (the provider may ring until its pending-call timeout).
 - The sideband consumes input transcript deltas and `session.delegation.created`, which contains timestamp/ID metadata, not a command. Fixed grammar, a recent complete phrase, a valid session, and a durable insert are required. The bridge suppresses Live's pending automatic delegation acknowledgment and emits its own correlated status **only after the SQLite commit**. OpenAI's native model may still speak independently; only a media relay that controls playback can guarantee silencing or exact words. Sideband receipt does not prove audibility.

@@ -3,12 +3,13 @@ const endButton = document.querySelector('#end');
 const playButton = document.querySelector('#play');
 const status = document.querySelector('#status');
 const audio = document.querySelector('#audio');
-let invited = false;
+let authorized = false;
+let trustedOwner = false;
 let live;
 
 function layout() {
   startButton.hidden = Boolean(live);
-  startButton.disabled = !invited;
+  startButton.disabled = !authorized;
   endButton.hidden = !live;
   endButton.disabled = Boolean(live?.closing);
   playButton.hidden = !live?.playBlocked || Boolean(live?.closing);
@@ -53,7 +54,7 @@ function finish(run, reason, unload = false) {
   if (!run.sentOffer) { dispose(run, reason || '연결을 취소했어요.'); return; }
   message('대화를 종료하는 중…');
   run.closeTimer = setTimeout(() => dispose(run, uncertain), 8000);
-  void post('/api/end', {}, { keepalive: true }).then((res) => {
+  void post('/api/end', run.permit ? { permit: run.permit } : {}, { keepalive: true }).then((res) => {
     // A provider session.closed event may arrive before the HTTP response.
     if (res.status === 204) dispose(run, reason || ended);
     else if (res.status !== 401) dispose(run, uncertain);
@@ -104,7 +105,7 @@ async function play(run) {
   }
 }
 async function begin() {
-  if (live || !invited || document.hidden) return;
+  if (live || !authorized || document.hidden) return;
   const run = { abort: new AbortController() };
   live = run;
   message('마이크 접근을 허용해 주세요…');
@@ -148,10 +149,25 @@ async function begin() {
     });
     await peer.setLocalDescription(await peer.createOffer());
     await waitForICE(peer, run.abort.signal);
+    if (!foreground(run)) return;
+    if (trustedOwner) {
+      // One invisible, tab-local permit for this button press. Not a saved
+      // login or billing mandate; without it a stale End can't affect new calls.
+      const preparation = await post('/api/prepare', { consent: true }, { signal: run.abort.signal });
+      if (!foreground(run)) return;
+      if (!preparation.ok) { dispose(run, '지금은 연결할 수 없어요. 잠시 후 다시 시작해 주세요.'); return; }
+      const { permit } = await preparation.json();
+      if (!/^[A-Za-z0-9_-]{43}$/.test(permit)) throw Error('invalid call permit');
+      run.permit = permit;
+    }
     if (!foreground(run)) return; // A billable POST must never start from a hidden page.
     run.sentOffer = true;
-    invited = false;
-    const response = await post('/api/session', { sdp: peer.localDescription.sdp, consent: true }, { signal: run.abort.signal });
+    if (!trustedOwner) authorized = false;
+    const scope = run.permit ? { permit: run.permit } : {};
+    const response = await post('/api/session', { sdp: peer.localDescription.sdp, consent: true, ...scope }, { signal: run.abort.signal });
+    if (response.status === 409 || response.status === 429) {
+      dispose(run, '지금은 연결할 수 없어요. 잠시 후 다시 시작해 주세요.'); return;
+    }
     if (!response.ok) throw Error('unable to initiate session');
     const { sdp } = await response.json();
     if (!foreground(run)) return;
@@ -159,7 +175,7 @@ async function begin() {
     if (!foreground(run)) return;
     run.leaseTimer = setInterval(async () => {
       try {
-        const reply = await post('/api/lease', {}, { signal: run.abort.signal });
+        const reply = await post('/api/lease', scope, { signal: run.abort.signal });
         if (!reply.ok) finish(run, '연결이 종료됐어요.');
       } catch { if (!run.closing) finish(run, '연결이 끊어졌어요.'); }
     }, 5000);
@@ -167,7 +183,7 @@ async function begin() {
     if (run !== live || run.closing) return;
     if (!run.mic) dispose(run, error?.name === 'NotAllowedError' ? '브라우저 설정에서 마이크를 허용한 후 다시 시작해 주세요.'
       : '마이크를 사용할 수 없어요. 휴대폰 설정을 확인해 주세요.');
-    else finish(run, '연결하지 못했어요. 초대와 네트워크를 확인해 주세요.');
+    else finish(run, trustedOwner ? '연결하지 못했어요. 비공개 네트워크를 확인해 주세요.' : '연결하지 못했어요. 초대와 네트워크를 확인해 주세요.');
   }
 }
 startButton.addEventListener('click', begin);
@@ -184,11 +200,11 @@ async function authorize() {
   if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) {
     message('HTTPS에서 Safari 또는 Chrome으로 열어 주세요.'); return;
   }
-  if (!match) { message('새 개인 초대 링크를 열어 주세요.'); return; }
   try {
-    const response = await post('/api/invite', { invite: match[1] });
-    invited = response.status === 204;
+    if (match) authorized = (await post('/api/invite', { invite: match[1] })).status === 204;
+    else trustedOwner = authorized = (await post('/api/owner', {})).status === 204;
   } catch { /* remain disarmed */ }
-  message(invited ? '시작하면 마이크가 켜지고 AI와 연결돼요.' : '초대가 만료됐거나 이미 사용됐어요.');
+  message(authorized ? '시작하면 마이크가 켜지고 AI와 연결돼요.'
+    : match ? '초대가 만료됐거나 이미 사용됐어요.' : '개인 링크 또는 비공개 접속 권한을 확인해 주세요.');
 }
 void authorize();
