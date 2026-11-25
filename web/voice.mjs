@@ -3,6 +3,7 @@ const endButton = document.querySelector('#end');
 const playButton = document.querySelector('#play');
 const status = document.querySelector('#status');
 const audio = document.querySelector('#audio');
+const contextNotice = document.querySelector('#context-notice');
 let authorized = false;
 let trustedOwner = false;
 let live;
@@ -218,6 +219,7 @@ async function authorize() {
       const response = await post('/api/owner', {});
       if (response.status === 423) { message('이전 연결의 종료를 확인 중이에요. 서버 확인 전에는 다시 시작할 수 없습니다.'); return; }
       trustedOwner = authorized = response.status === 204;
+      contextNotice.hidden = !(trustedOwner && response.headers.get('X-Voice-Mode') === 'owner-context');
     }
   } catch { /* remain disarmed */ }
   message(authorized ? '시작하면 마이크가 켜지고 AI와 연결돼요.'

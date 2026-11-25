@@ -7,7 +7,7 @@ Talk to **GPT-Live** and let your **existing Pots bot** handle background drafts
 | **Mobile web (no number)** | Open the owner’s saved private URL or a one-time test invitation in Safari or Chrome while parked, approve the displayed cost and microphone, then talk hands-free. Browser and GPT-Live stream both directions over WebRTC. | Local protocol fixtures and native Chromium synthetic-mic test; live provider, iOS/Android, Bluetooth, and barge-in need a [parked paid smoke test](docs/web-smoke.md). |
 | **Inbound SIP** | Dial the configured SIP number and enter the one-time keypad PIN. | Local signed webhook and SIP control fixtures; real trunk, carrier and handset require the separate [paid SIP smoke](docs/sip-smoke.md). |
 
-Both use the **GPT-Live API with client delegation**, not OpenAI Realtime, clip uploads, speech-to-text turns, or push-to-talk. Hang up or close the page and accepted work still runs; detailed results go only to the same operator-configured private Telegram inbox. This is a single-owner prototype, not a public service. The only presets draft meeting or weekly-review checklists and follow-up **templates**. They do not send mail, run commands, approve actions, or access private records.
+Both use the **GPT-Live API with client delegation**, not OpenAI Realtime, clip uploads, speech-to-text turns, or push-to-talk. Hang up or close the page and accepted work still runs; detailed results go only to the same operator-configured private Telegram inbox. This is a single-owner prototype, not a public service. Default presets draft meeting or weekly-review checklists and follow-up **templates**. The separate [private owner-context opt-in](docs/owner-context.md) can route a natural read-only question or harmless draft request to the same existing Pots main agent. Neither path authorizes mail, command execution, approvals or other high-impact actions.
 
 ```text
 Phone browser ⇄ native WebRTC audio ⇄ OpenAI GPT-Live
@@ -39,7 +39,7 @@ The demo checks that a response is not emitted before the SQLite commit, that a 
 1. **While parked**, choose one path:
    - **Web:** open your [saved private owner URL](docs/owner-bookmark.md) if that mode is enabled, otherwise open a fresh personal invitation at the configured private HTTPS origin. Tap **비용에 동의하고 시작** (agree to the cost and start), allow microphone access, and wait for **연결됐어요** (connected). The page discloses the normal Live voice rate of **US$0.05 per minute** before each Start; Pots costs are separate. Use End to stop. `소리 켜기` (enable sound) appears only if autoplay is blocked. No dialing, push-to-talk, or tap after each request.
    - **SIP:** the operator arms one attempt and gets a single-use eight-digit code. Dial within two minutes; wait for the prompt, enter the code with the keypad followed by `#`, and wait for pairing confirmation. Never read the code aloud.
-2. Speak a full request, including its ending marker:
+2. In [private owner-context mode](docs/owner-context.md), ask naturally, with no ending marker; your existing Pots agent supplies the answer. For default presets on web and SIP, speak the full request, including its ending marker:
 
    | English | 한국어 |
    | --- | --- |
@@ -48,7 +48,7 @@ The demo checks that a response is not emitted before the SQLite commit, that a 
    | “Queue follow-up email template, end request.” | “후속 이메일 양식 접수, 요청 끝.” |
 
    The matching is deliberately strict: speak the phrase as one utterance. Conversation can continue normally between requests. When the assembled text does not exactly match, the bridge does not queue the task. GPT-Live does not send a transcript-done event in this API; even a complete-looking phrase may be a quote, a late or truncated fragment, or an ASR mishearing. Keep presets harmless even if triggered unintentionally. Each preset can be queued once per call.
-3. “Task queued” and its short receipt mean the bridge committed a job, **not** that a child started. A result that finishes during the call yields a short status update; detailed results go only to the configured inbox, whether or not the caller is still on the line. The inbox message includes the full receipt, matched excerpt, result, and optional artifact link.
+3. “Task queued” (or “Request queued” in owner-context mode) and the short receipt mean the bridge committed a job, **not** that a child started. A result that finishes during the call yields a short status update; detailed results go only to the configured inbox, whether or not the caller is still on the line. The inbox message includes the full receipt, result, and optional artifact link. Default preset results include the matched preset phrase; owner-context results do not echo the spoken request.
 
 ## Opt-in real web setup (number-free)
 
@@ -61,6 +61,8 @@ node src/cli.mjs invite-web   # private service-owner TTY; returns one-time URL
 ```
 
 For a **stable, bookmarkable URL with no invite or browser registration**, see [trusted owner bookmark mode](docs/owner-bookmark.md). It requires a separately authenticated owner-device HTTPS gate; the default above continues to require a one-time invite. In either mode, opening the page never activates the microphone or starts a paid session.
+
+To opt in to the existing agent’s context from that bookmark, also configure the fixed bot/DM route and the [main-agent instructions](docs/owner-context.md). Without that separate flag, the bookmark uses the default presets.
 
 To enable both transports, run **one** `serve --enable-paid-sip --enable-paid-webrtc` process with two distinct loopback ports. The transports share one call slot and one SQLite queue; issue only one SIP arm or web invitation at a time. The worker is separate and needs its own explicit `--enable-pots-effects` switch regardless of transport.
 
@@ -98,6 +100,6 @@ To enable both transports, run **one** `serve --enable-paid-sip --enable-paid-we
 - The sideband consumes input transcript deltas and `session.delegation.created`, which contains timestamp/ID metadata, not a command. Fixed grammar, a recent complete phrase, a valid session, and a durable insert are required. The bridge suppresses Live's pending automatic delegation acknowledgment and emits its own correlated status **only after the SQLite commit**. OpenAI's native model may still speak independently; only a media relay that controls playback can guarantee silencing or exact words. Sideband receipt does not prove audibility.
 - Voice streaming does not await an LLM child. `session.closed`, socket failure, or voice interruption cannot erase an accepted job. No cross-call audio/session recovery is promised. On restart, the bridge attempts cleanup of unclosed provider sessions (SIP REST hangup or WebRTC sideband close). Ambiguous web cleanup blocks both transports until confirmed; legacy SIP reservations age out as documented. Re-arm for a new call; outstanding work remains in the queue.
 - SQLite persists receipts, wake state, claims, and result delivery. Pots operations retry with stable IDs. A claim is single-consumer: crashes **after** a claim but before a child is started are intentionally not replayed automatically; reconcile from the selected bot, then complete or mark failed. Message-platform delivery under ambiguous external failure is not advertised as exactly once.
-- No raw audio, arbitrary conversation transcript, SIP headers, DTMF digits, or API credentials are persisted by the bridge. The allowlisted excerpt, task status, and text result are retained locally and sent to the fixed inbox where applicable. The Live session explicitly sets `store: false` (no opt-in session storage for forking/recording download). Third-party abuse monitoring or other retention is independent. There is no general shell, deployment, notification targeting, or approval tool over the voice call.
+- No raw audio, complete conversation transcript, SIP headers, DTMF digits, or API credentials are persisted by the bridge. The allowlisted preset excerpt or short matched owner-context request, task status, and text result are retained locally as needed. Owner-context request text is not echoed to the inbox. The Live session explicitly sets `store: false` (no opt-in session storage for forking/recording download). Third-party abuse monitoring or other retention is independent. There is no general shell, deployment, notification targeting, or approval tool over the voice call.
 
 See [security and operations](docs/security.md), [test scope](docs/testing.md), and the official protocol references for [web](docs/web-smoke.md#references) and [SIP](docs/sip-smoke.md#references). Contributions welcome via [CONTRIBUTING.md](CONTRIBUTING.md).

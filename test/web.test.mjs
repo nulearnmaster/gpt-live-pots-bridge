@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { createServer, request } from 'node:http';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -9,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { WebSocketServer } from 'ws';
 import { Bridge } from '../src/bridge.mjs';
+import { ownerContextRoute } from '../src/policy.mjs';
 import { openAI } from '../src/openai.mjs';
 import { listen, listenLocal, localRequest, localServer, stopServer } from '../src/server.mjs';
 import { Store } from '../src/store.mjs';
@@ -81,7 +83,7 @@ async function fakeLive() {
   return state;
 }
 
-async function setup(t, { legacy = false, owner = false } = {}) {
+async function setup(t, { legacy = false, owner = false, contextRoute = null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'web-bridge-'));
   const dbPath = join(dir, 'queue.sqlite');
   const workerPath = join(dir, 'worker.sock');
@@ -93,14 +95,13 @@ async function setup(t, { legacy = false, owner = false } = {}) {
     db.exec(`CREATE TABLE calls (session TEXT PRIMARY KEY, delivery TEXT NOT NULL UNIQUE, created INTEGER NOT NULL,
       closed INTEGER NOT NULL DEFAULT 0) STRICT; INSERT INTO calls VALUES ('old_sip', 'old_delivery', 1, 1);`);
     db.close();
-    const { chmodSync } = await import('node:fs');
     chmodSync(dbPath, 0o600);
   }
   const fake = await fakeLive();
   let running;
   async function launch(recover = false) {
     const store = new Store(dbPath);
-    const bridge = new Bridge({ store, provider: fake.provider, webOrigin: origin, trustedWebOwner: owner, clock: () => now });
+    const bridge = new Bridge({ store, provider: fake.provider, webOrigin: origin, trustedWebOwner: owner, contextRoute, clock: () => now });
     const web = await listen(webServer(bridge, owner ? fixtureGate : null), { host: '127.0.0.1', port: 0 });
     const worker = await listenLocal(localServer(bridge), workerPath, 0o600);
     const admin = await listenLocal(localServer(bridge, true), adminPath, 0o600);
@@ -487,4 +488,171 @@ test('a healthy web lease keeps a call open past two minutes; a missed heartbeat
   await h.running().bridge.call.ending;
   assert.equal(h.fake.events.filter(({ type }) => type === 'session.close').length, 1);
   assert.deepEqual(h.running().store.unclosed(h.time(0)), []);
+});
+
+function fixtureCli(worker, args, value) {
+  const bin = fileURLToPath(new URL('../src/cli.mjs', import.meta.url));
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', bin, ...args],
+      { env: { PATH: process.env.PATH, VOICE_WORKER_SOCKET: worker } });
+    let result = '';
+    child.stdout.on('data', (chunk) => { result += chunk; });
+    child.on('error', reject);
+    child.on('close', (code) => resolve({ code, value: result ? JSON.parse(result) : null }));
+    child.stdin.end(value === undefined ? '' : JSON.stringify(value));
+  });
+}
+
+test('local end-to-end: trusted owner context wakes the existing omarchy bot, relays its approved answer, and delivers elsewhere only to its configured DM', async (t) => {
+  const bot = 'omarchy';
+  const address = 'telegram:#123456';
+  const route = ownerContextRoute(bot, address);
+  const h = await setup(t, { owner: true, contextRoute: route });
+  const { fake, local } = h;
+  const post = (path, data) => h.web(path, { data, headers: ownerHeaders });
+  const open = async () => {
+    const { permit } = JSON.parse((await post('/api/prepare', { consent: true })).body);
+    assert.equal((await post('/api/session', { consent: true, sdp, permit })).status, 201);
+    return permit;
+  };
+  for (const [key, value] of [['FAKE_POTS_LEDGER', h.ledgerPath], ['FAKE_POTS_EXPECT_BOT', bot]]) {
+    const original = process.env[key];
+    process.env[key] = value;
+    t.after(() => { if (original === undefined) delete process.env[key]; else process.env[key] = original; });
+  }
+  const binary = fileURLToPath(new URL('../fixtures/pots.mjs', import.meta.url));
+  const sink = potsSink({ binary, bot, address });
+  const work = (selectedRoute = route, selectedSink = sink) => workOnce(local, selectedSink, null, () => {}, selectedRoute);
+  const invoke = (args, value) => fixtureCli(h.running().worker.address(), args, value);
+  const fullQuestion = '지난번에 텔레그램에서 내가 부탁했던 게 뭐였지?';
+  assert.equal((await post('/api/owner', {})).headers['x-voice-mode'], 'owner-context');
+  const firstPermit = await open();
+  const id = 'live_web_1';
+  const sent = fake.requests[0].session;
+  assert.equal(sent.model, 'gpt-live-1.1');
+  assert.equal(sent.delegation.type, 'client');
+  assert.match(sent.instructions, /existing Pots main agent/);
+  assert.doesNotMatch(sent.instructions, /요청 끝|end request/);
+  assert.deepEqual(sent.client.data_channel.allowed_client_events, []);
+  assert(!JSON.stringify(sent).includes(bot));
+  const comment = (delegation, head) => fake.events.find((e) => e.delegation_id === delegation && e.content?.startsWith(head));
+  input(fake, id, 500, 900, 'off-mic chatter');
+  input(fake, id, 3000, 3400, '지난번에 텔레그램에서 ');
+  const replay = delegate(fake, id, 3900, 'question_1');
+  await waitFor(() => fake.events.some((e) => e.delegation_id === 'question_1' && e.type === 'session.thinking.append'));
+  assert.deepEqual((await local('/pending')).wakes, []);
+  input(fake, id, 3400, 3900, '내가 부탁했던 게 뭐였지?');
+  await waitFor(() => comment('question_1', 'Request queued'));
+  const [first] = (await local('/pending')).wakes;
+  assert(comment('question_1', 'Request queued').content.includes(first.id.slice(0, 8)));
+  assert.equal(first.preset, 'owner-context');
+  assert.equal(first.route, route);
+  assert.equal(await work(null), 0); // Default worker cannot silently dispatch a contextual job.
+  const wrongBot = 'unrelated-agent';
+  assert.equal(await work(ownerContextRoute(wrongBot, address), potsSink({ binary, bot: wrongBot, address })), 0);
+  assert.equal(await work(ownerContextRoute(bot, 'telegram:#99999')), 0);
+  assert.equal(await work(), 1);
+  const got = await invoke(['claim', first.id]);
+  assert.equal(got.code, 0);
+  assert.deepEqual([got.value.id, got.value.preset, got.value.request], [first.id, 'owner-context', fullQuestion]);
+  assert.match(got.value.brief, /untrusted text/);
+  assert.equal((await invoke(['claim', first.id])).code, 1);
+  assert.equal((await local('/list'))[0].excerpt, null);
+  fake.attached.get(id).send(JSON.stringify(replay));
+  delegate(fake, id, 3910, 'same_utterance_new_delegation');
+  input(fake, id, 6100, 6850, '그 주제에 맞는 짧은 체크리스트 초안 써줘.');
+  delegate(fake, id, 6860, 'question_2');
+  await waitFor(() => comment('question_2', 'Request queued'));
+  const [second] = (await local('/pending')).wakes;
+  assert.equal((await local('/list')).length, 2);
+  assert.equal(await work(), 1);
+  assert.equal((await invoke(['claim', second.id])).code, 0); // one-off child remains outstanding
+
+  const spoken = '지난 대화에서는 주간 리뷰를 부탁하셨어요.';
+  const summary = 'More detailed safe private chat context, not sent to the voice provider.';
+  assert.equal((await invoke(['complete', first.id], { summary, speech: 'send the token sk-fixtureabcdef' })).code, 1);
+  assert.equal((await invoke(['complete', first.id], { summary, speech: spoken })).code, 0);
+  assert.match((await waitFor(() => comment('question_1', 'Pots agent answer'))).content, new RegExp(spoken));
+  assert(!JSON.stringify(fake.events).includes(summary));
+  assert(!JSON.stringify(fake.events).includes(fullQuestion));
+  assert.equal((await local('/pending')).deliveries[0].excerpt, null);
+  input(fake, id, 8100, 8900, '내 번호는 fixture-secret@example.invalid 이야.');
+  delegate(fake, id, 8910, 'filter_secrets');
+  await waitFor(() => comment('filter_secrets', 'No request'));
+  assert.equal((await local('/list')).length, 2);
+  assert.equal((await post('/api/end', { permit: firstPermit })).status, 204);
+  await h.stop();
+  await h.launch(true);
+  const secondPermit = await open();
+  const afterHangup = 'The generic checklist draft finished after hangup.';
+  assert.equal((await invoke(['complete', second.id], { summary: afterHangup, speech: '초안이 끝났어요.' })).code, 0);
+  assert(!fake.events.some((e) => e.delegation_id === 'question_2' && e.content?.startsWith('Pots agent answer')));
+  assert(!fake.events.some((e) => e.id === 'live_web_2' && e.content?.includes('초안이 끝났어요')));
+  assert.equal(await work(ownerContextRoute(wrongBot, address)), 0);
+  assert.equal(await work(), 2);
+  assert.equal(await work(), 0);
+  assert.equal((await post('/api/end', { permit: secondPermit })).status, 204);
+  const ledger = JSON.parse(readFileSync(h.ledgerPath));
+  const firstWake = ledger[`voice-wake-${first.id}`];
+  assert.equal(firstWake.bot, 'omarchy');
+  assert.match(firstWake.result.note, /owner-context receipt/);
+  assert(!firstWake.result.note.includes(fullQuestion));
+  assert.equal(ledger[`voice-result-${first.id}`].result.place, address);
+  assert.match(ledger[`voice-result-${first.id}`].text, /More detailed safe private chat context/);
+  assert.doesNotMatch(ledger[`voice-result-${first.id}`].text, /Heard:|텔레그램에서/);
+  assert(ledger[`voice-result-${second.id}`].text.includes(afterHangup));
+  assert.equal(h.running().store.db.prepare('SELECT excerpt FROM jobs WHERE id=?').get(first.id).excerpt, '');
+});
+
+test('owner context cannot opt in through invitation mode, SIP, or its public request JSON', async (t) => {
+  const route = ownerContextRoute('omarchy', 'telegram:#123456');
+  const h = await setup(t, { owner: true });
+  assert.throws(() => new Bridge({ store: h.running().store, provider: h.fake.provider, webOrigin: origin, contextRoute: route }), /trusted private/);
+  assert.equal((await fixtureCli(h.running().worker.address(), ['serve', '--enable-paid-sip', '--enable-owner-context'])).code, 2);
+  assert.equal((await fixtureCli(h.running().worker.address(), ['serve', '--enable-paid-webrtc', '--enable-owner-context'])).code, 2);
+  assert.equal((await fixtureCli(h.running().worker.address(), ['worker', '--enable-owner-context'])).code, 2);
+  const post = (path, data) => h.web(path, { data, headers: ownerHeaders });
+  const { permit } = JSON.parse((await post('/api/prepare', { consent: true })).body);
+  assert.equal((await post('/api/session', { consent: true, sdp, permit, mode: 'owner-context' })).status, 400);
+  assert.equal((await post('/api/session', { consent: true, sdp, permit })).status, 201);
+  assert.match(h.fake.requests[0].session.instructions, /end request/);
+  input(h.fake, 'live_web_1', 2200, 3000, '내가 전에 뭘 부탁했지?');
+  delegate(h.fake, 'live_web_1', 3010, 'out_of_scope');
+  await waitFor(() => h.fake.events.some((e) => e.content?.startsWith('No task was queued')));
+  assert.deepEqual(await h.local('/list'), []);
+});
+
+test('previous job schema migrates transactionally without losing rows or per-preset dedup; contextual turns are bounded', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'voice-old-schema-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const dbPath = join(dir, 'queue.sqlite');
+  const previous = new DatabaseSync(dbPath);
+  previous.exec(`CREATE TABLE jobs (
+    id TEXT PRIMARY KEY, session TEXT NOT NULL, delegation TEXT NOT NULL, preset TEXT NOT NULL,
+    excerpt TEXT NOT NULL, created INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'queued',
+    wake_recorded INTEGER NOT NULL DEFAULT 0, delivery_recorded INTEGER NOT NULL DEFAULT 0,
+    summary TEXT, link TEXT, finished INTEGER, UNIQUE (session, delegation), UNIQUE (session, preset)
+  ) STRICT;
+  CREATE INDEX jobs_pending ON jobs(wake_recorded, delivery_recorded, created);
+  INSERT INTO jobs VALUES ('preset_receipt','sip_1','delegation_1','weekly-review','queue weekly review checklist end request',
+    99,'claimed',1,0,NULL,NULL,NULL);`);
+  previous.close();
+  // open mode is checked on boot, as for production DBs.
+  chmodSync(dbPath, 0o600);
+  const store = new Store(dbPath);
+  try {
+    assert.equal(store.list()[0].state, 'claimed');
+    assert.deepEqual(store.queue('sip_1', 'other_delegation', { preset: 'weekly-review', excerpt: 'unchanged' }, 100), { accepted: false });
+    const route = ownerContextRoute('omarchy', 'telegram:#123456');
+    const add = (delegation, turnEnd) => store.queue('web_1', delegation,
+      { preset: 'owner-context', excerpt: `Korean or English question ${turnEnd}`, turnEnd, route }, 101);
+    assert.equal(add('first', 10).accepted, true);
+    assert.deepEqual(add('duplicate', 10), { accepted: false });
+    for (let i = 0; i < 7; i++) assert.equal(add(`distinct_${i}`, i + 11).accepted, true);
+    assert.deepEqual(add('at_capacity', 100), { accepted: false });
+    const item = store.pending().wakes[0];
+    assert(store.claim(item.id));
+    assert(store.finish(item.id, { summary: 'Safe result', link: null }, 102));
+    assert.equal(add('after_finish', 101).accepted, true);
+  } finally { store.close(); }
 });

@@ -5,7 +5,7 @@ import { Store } from './store.mjs';
 import { openAI, signingKey } from './openai.mjs';
 import { listen, listenLocal, localRequest, localServer, publicServer, requirePrivateDirectory, stopServer } from './server.mjs';
 import { trustedOwnerConfig, webServer } from './web.mjs';
-import { tasks, isPreset, receiptPattern } from './policy.mjs';
+import { tasks, cleanOwnerRequest, isPreset, ownerBrief, ownerContextRoute, ownerPreset, receiptPattern } from './policy.mjs';
 import { potsSink, workOnce } from './worker.mjs';
 
 const env = process.env;
@@ -24,7 +24,8 @@ function port(value) {
   if (!Number.isInteger(parsed) || parsed < 1024 || parsed > 65535) throw Error('invalid port');
   return parsed;
 }
-async function serve({ sip, web, owner }) {
+async function serve({ sip, web, owner, context }) {
+  const contextRoute = context ? ownerContextRoute(env.VOICE_POTS_BOT, env.VOICE_RESULT_ADDRESS) : null;
   const gate = owner ? trustedOwnerConfig(env.VOICE_WEB_OWNER_LOGIN, env.VOICE_WEB_PROXY_KEY) : null;
   const sipPort = sip ? port(env.VOICE_WEBHOOK_PORT ?? '8788') : null;
   const webPort = web ? port(env.VOICE_WEB_PORT ?? '8789') : null;
@@ -38,7 +39,7 @@ async function serve({ sip, web, owner }) {
   requirePrivateDirectory(env.VOICE_ADMIN_SOCKET, true);
   requirePrivateDirectory(env.VOICE_WORKER_SOCKET);
   const store = new Store(env.VOICE_STATE_DB);
-  const bridge = new Bridge({ store, provider: openAI(env.OPENAI_API_KEY, { webVoice: web ? env.VOICE_WEB_VOICE : undefined }), linkOrigin, webOrigin, trustedWebOwner: owner });
+  const bridge = new Bridge({ store, provider: openAI(env.OPENAI_API_KEY, { webVoice: web ? env.VOICE_WEB_VOICE : undefined }), linkOrigin, webOrigin, trustedWebOwner: owner, contextRoute });
   const servers = [];
   let stopping;
   let maintenance;
@@ -62,7 +63,8 @@ async function serve({ sip, web, owner }) {
     complain('listening on loopback; no inbound grant issued');
   } catch (error) { await stop(); throw error; }
 }
-async function worker() {
+async function worker(context) {
+  const contextRoute = context ? ownerContextRoute(env.VOICE_POTS_BOT, env.VOICE_RESULT_ADDRESS) : null;
   const linkOrigin = origin();
   const sink = potsSink({ binary: env.VOICE_POTS_BIN, bot: env.VOICE_POTS_BOT, address: env.VOICE_RESULT_ADDRESS });
   const stop = new AbortController();
@@ -73,7 +75,7 @@ async function worker() {
     let failed = false;
     let itemFailed = false;
     try {
-      await workOnce(local, sink, linkOrigin, () => { itemFailed = failed = true; });
+      await workOnce(local, sink, linkOrigin, () => { itemFailed = failed = true; }, contextRoute);
     } catch { failed = true; }
     if (failed) complain(itemFailed ? 'Pots operation not confirmed; retrying with its original ID' : 'worker socket unavailable');
     delay = failed ? Math.min(delay * 2, 30_000) : 1000;
@@ -89,8 +91,8 @@ async function readResult() {
     pieces.push(bytes);
   }
   const result = JSON.parse(Buffer.concat(pieces));
-  if (!result || typeof result !== 'object' || Array.isArray(result) || Object.keys(result).some((key) => !['summary', 'link'].includes(key))) {
-    throw Error('expected summary and optional link');
+  if (!result || typeof result !== 'object' || Array.isArray(result) || Object.keys(result).some((key) => !['summary', 'link', 'speech'].includes(key))) {
+    throw Error('expected summary and optional link or speakable answer');
   }
   return result;
 }
@@ -103,24 +105,31 @@ async function main(args) {
     const sip = flags.includes('--enable-paid-sip');
     const web = flags.includes('--enable-paid-webrtc');
     const owner = flags.includes('--enable-trusted-web-owner');
-    if ((sip || web) && (!owner || web) && flags.length === Number(sip) + Number(web) + Number(owner)) {
-      return serve({ sip, web, owner });
+    const context = flags.includes('--enable-owner-context');
+    if ((sip || web) && (!owner || web) && (!context || owner) &&
+        flags.length === Number(sip) + Number(web) + Number(owner) + Number(context)) {
+      return serve({ sip, web, owner, context });
     }
   }
-  if (command === 'worker' && arg === '--enable-pots-effects' && args.length === 2) return worker();
+  if (command === 'worker' && arg === '--enable-pots-effects' && args.length === 2) return worker(false);
+  if (command === 'worker' && arg === '--enable-pots-effects' && args[2] === '--enable-owner-context' && args.length === 3) return worker(true);
   if (command === 'arm' && args.length === 1 && process.stdout.isTTY) return print(await localRequest(env.VOICE_ADMIN_SOCKET, '/arm'));
   if (command === 'invite-web' && args.length === 1 && process.stdout.isTTY) return print(await localRequest(env.VOICE_ADMIN_SOCKET, '/invite-web'));
   if (command === 'list' && args.length === 1) return print(await local('/list'));
   if (args.length === 2 && receiptPattern.test(arg)) {
     if (command === 'claim') {
       const claim = await local('/claim', { id: arg });
-      if (claim.id !== arg || !isPreset(claim.preset)) throw Error('invalid claim');
+      if (claim.id !== arg) throw Error('invalid claim');
+      if (claim.preset === ownerPreset && cleanOwnerRequest(claim.request) === claim.request) {
+        return print({ id: claim.id, preset: claim.preset, request: claim.request, brief: ownerBrief });
+      }
+      if (!isPreset(claim.preset)) throw Error('invalid claim');
       return print({ ...claim, brief: tasks[claim.preset] });
     }
     if (command === 'complete') return print(await local('/complete', { ...await readResult(), id: arg }));
     if (command === 'fail') return print(await local('/fail', { id: arg }));
   }
-  complain('usage: serve --enable-paid-sip and/or --enable-paid-webrtc [--enable-trusted-web-owner] | worker --enable-pots-effects | arm or invite-web (TTY only) | list | claim ID | complete ID (JSON stdin) | fail ID');
+  complain('usage: serve --enable-paid-sip and/or --enable-paid-webrtc [--enable-trusted-web-owner [--enable-owner-context]] | worker --enable-pots-effects [--enable-owner-context] | arm or invite-web (TTY only) | list | claim ID | complete ID (JSON stdin) | fail ID');
   process.exitCode = 2;
 }
 main(process.argv.slice(2)).catch(() => { complain('command failed; check local setup, permissions, input and receipt state'); process.exitCode = 1; });

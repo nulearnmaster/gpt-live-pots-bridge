@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { isAbsolute } from 'node:path';
-import { cleanResult, isPreset, matchesExcerpt, receiptPattern } from './policy.mjs';
+import { cleanResult, isPreset, matchesExcerpt, ownerPreset, receiptPattern, validBotName, validResultAddress } from './policy.mjs';
 
 function run(binary, args, env, input) {
   return new Promise((resolve, reject) => {
@@ -26,9 +26,7 @@ function run(binary, args, env, input) {
 const failure = () => process.stderr.write('voice-bridge worker: item not confirmed; keeping its stable retry ID\n');
 
 export function potsSink({ binary, bot, address }) {
-  if (typeof binary !== 'string' || !isAbsolute(binary) || typeof bot !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(bot) ||
-      typeof address !== 'string' || !/^telegram:#[1-9][0-9]{0,15}$/.test(address) ||
-      !Number.isSafeInteger(Number(address.slice('telegram:#'.length)))) {
+  if (typeof binary !== 'string' || !isAbsolute(binary) || !validBotName(bot) || !validResultAddress(address)) {
     throw Error('configure an absolute Pots binary, bot, and verified canonical Telegram DM place');
   }
   return async (kind, id, text) => {
@@ -49,23 +47,29 @@ export function potsSink({ binary, bot, address }) {
   };
 }
 
-export async function workOnce(local, sink, linkOrigin = null, notifyFailure = failure) {
+export async function workOnce(local, sink, linkOrigin = null, notifyFailure = failure, contextRoute = null) {
   const { wakes, deliveries } = await local('/pending');
   let confirmed = 0;
   for (const item of wakes) {
     try {
-      if (!receiptPattern.test(item.id) || !isPreset(item.preset)) throw Error('invalid wake payload');
-      await sink('wake', item.id, `Voice bridge has a scoped draft receipt ${item.id}. Use only the locally installed voice-bridge claim/dispatch procedure.`);
+      const context = item.preset === ownerPreset && contextRoute && item.route === contextRoute;
+      if (!receiptPattern.test(item.id) || (!context && !isPreset(item.preset))) throw Error('invalid wake payload');
+      await sink('wake', item.id, context
+        ? `Voice bridge has an owner-context receipt ${item.id}. Use only the locally installed voice-bridge main-agent claim/dispatch procedure.`
+        : `Voice bridge has a scoped draft receipt ${item.id}. Use only the locally installed voice-bridge claim/dispatch procedure.`);
       await local('/mark-wake', { id: item.id });
       confirmed++;
     } catch { notifyFailure(); }
   }
   for (const item of deliveries) {
     try {
-      if (!receiptPattern.test(item.id) || !matchesExcerpt(item.preset, item.excerpt) || !['done', 'failed'].includes(item.state)) throw Error('invalid result payload');
+      const context = item.preset === ownerPreset && contextRoute && item.route === contextRoute;
+      if (!receiptPattern.test(item.id) || (!context && !matchesExcerpt(item.preset, item.excerpt)) || !['done', 'failed'].includes(item.state)) throw Error('invalid result payload');
       const result = cleanResult(item, linkOrigin);
       if (!result) throw Error('invalid result');
-      const message = `Voice draft: ${item.state}\nReceipt: ${item.id}\nPreset: ${item.preset}\nHeard: ${item.excerpt}\n\n${result.summary}${result.link ? `\n\n${result.link}` : ''}`;
+      const heading = context ? `Pots voice request: ${item.state}\nReceipt: ${item.id}`
+        : `Voice draft: ${item.state}\nReceipt: ${item.id}\nPreset: ${item.preset}\nHeard: ${item.excerpt}`;
+      const message = `${heading}\n\n${result.summary}${result.link ? `\n\n${result.link}` : ''}`;
       await sink('send', item.id, message);
       await local('/mark-delivery', { id: item.id });
       confirmed++;

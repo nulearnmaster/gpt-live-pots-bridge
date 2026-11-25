@@ -129,7 +129,9 @@ export function webServer(bridge, gate = null) {
       const keys = Object.keys(data);
       if (gate) {
         if (req.url === '/api/owner') {
-          reply(res, keys.length ? 400 : bridge.ownerWebAwaitingRecovery() ? 423 : 204); return;
+          const status = keys.length ? 400 : bridge.ownerWebAwaitingRecovery() ? 423 : 204;
+          reply(res, status, '', status === 204 && bridge.contextRoute ? { 'X-Voice-Mode': 'owner-context' } : {});
+          return;
         }
         if (req.url === '/api/prepare') {
           if (keys.length !== 1 || data.consent !== true) { reply(res, 400); return; }
